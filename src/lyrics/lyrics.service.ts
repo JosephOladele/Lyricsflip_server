@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ConflictException,
   Inject,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -184,6 +185,49 @@ export class LyricsService {
     });
   }
 
+  /**
+   * Load a lyric regardless of its active state. Admin-only: used by the
+   * restore flow, which must be able to see soft-deleted (inactive) lyrics.
+   * Bypasses the cache so a stale active-only entry cannot mask the row.
+   */
+  async findOneIncludingInactive(id: number): Promise<Lyrics> {
+    if (!id || id <= 0) {
+      throw new BadRequestException('Invalid lyrics ID');
+    }
+
+    const dbLyrics = await this.lyricsRepository.findOne({
+      where: { id },
+      relations: ['createdBy'],
+    });
+
+    if (!dbLyrics) {
+      throw new NotFoundException('Lyrics not found');
+    }
+
+    return dbLyrics;
+  }
+
+  /**
+   * Restore a soft-deleted lyric by setting isActive back to true. Throws
+   * ConflictException when the lyric is already active.
+   */
+  async restore(id: number): Promise<Lyrics> {
+    const lyrics = await this.findOneIncludingInactive(id);
+
+    if (lyrics.isActive) {
+      throw new ConflictException('Lyrics is already active');
+    }
+
+    lyrics.isActive = true;
+    const restored = await this.lyricsRepository.save(lyrics);
+
+    // The restored lyric must reappear in lists, categories, random and
+    // search results, so drop every lyrics cache entry.
+    await this.clearCache();
+
+    return restored;
+  }
+
   async update(
     id: number, // Fixed: should be number, not string
     updateLyricsDto: UpdateLyricsDto,
@@ -253,304 +297,6 @@ export class LyricsService {
   }
 
   /**
-   * Normalise a value for alias comparison: lower-case, trim, and collapse
-   * internal whitespace so "JAY Z" and "Jay-Z" compare equal.
-   */
-  private normalizeAnswer(value: string): string {
-    return value
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, ' ')
-      .trim();
-  }
+   * Normalise a value for alias comparison: lower-case, trim,
 
-  /**
-   * Check whether a guess matches the canonical value or any of its aliases.
-   * Comparison is case- and punctuation-insensitive so "Jay-Z" matches
-   * "JAY Z" and "WizKid" matches "Wizkid".
-   */
-  matchesAnswer(
-    guess: string,
-    canonical: string,
-    aliases: string[] = [],
-  ): boolean {
-    if (!guess) {
-      return false;
-    }
-
-    const normalizedGuess = this.norma
-
-/* … truncated 927 chars — edit only what you need near the top … */
-    const normalizedGuess = this.normalizeAnswer(guess);
-    if (!normalizedGuess) {
-      return false;
-    }
-
-    const candidates = [canonical, ...(aliases ?? [])];
-    return candidates.some(
-      (candidate) =>
-        candidate != null &&
-        this.normalizeAnswer(candidate) === normalizedGuess,
-    );
-  }
-
-  /**
-   * Score a guess against a lyric's canonical artist/title and their aliases.
-   * A guess that matches an alias is scored as correct.
-   */
-  scoreGuess(
-    lyrics: Lyrics,
-    guess: { artist?: string; title?: string },
-  ): { artistCorrect: boolean; titleCorrect: boolean } {
-    return {
-      artistCorrect: this.matchesAnswer(
-        guess.artist ?? '',
-        lyrics.artist,
-        lyrics.artistAliases,
-      ),
-      titleCorrect: this.matchesAnswer(
-        guess.title ?? '',
-        lyrics.songTitle,
-        lyrics.titleAliases,
-      ),
-    };
-  }
-
-  /**
-   * Load a value through the cache, recording the key so it can be
-   * invalidated later. A read that began before an invalidation must not
-   * repopulate the cache with stale data, hence the generation check.
-   */
-  private async getOrLoad<T>(
-    cacheKey: string,
-    ttlMs: number,
-    loader: () => Promise<T>,
-  ): Promise<T> {
-    const cached = await this.cacheManager.get<T>(cacheKey);
-    if (cached !== undefined && cached !== null) {
-      return cached;
-    }
-
-    const generation = this.cacheGeneration;
-    const value = await loader();
-
-    if (generation === this.cacheGeneration) {
-      await this.cacheManager.set(cacheKey, value, ttlMs);
-      this.cachedKeys.set(cacheKey, Date.now() + ttlMs);
-    }
-
-    return value;
-  }
-
-  /**
-   * Return a random active lyric. The result is cached briefly so repeated
-   * calls do not hammer the database.
-   */
-  async getRandomLyrics(): Promise<Lyrics> {
-    const cacheKey = `${cacheConfig.keys.random}${Date.now()}`;
-
-    const lyrics = await this.lyricsRepository
-      .createQueryBuilder('lyrics')
-      .leftJoinAndSelect('lyrics.createdBy', 'user')
-      .where('lyrics.isActive = :isActive', { isActive: true })
-      .orderBy('RANDOM()')
-      .getOne();
-
-    if (!lyrics) {
-      throw new NotFoundException('No lyrics available');
-    }
-
-    await this.cacheManager.set(cacheKey, lyrics, this.cacheTtlMs);
-    this.cachedKeys.set(cacheKey, Date.now() + this.cacheTtlMs);
-
-    return lyrics;
-  }
-
-  /**
-   * Return active lyrics for a genre or decade. Exactly one filter is used;
-   * genre takes precedence when both are supplied.
-   */
-  async getLyricsByCategory(
-    category: { genre?: string; decade?: number },
-    limit: number = MAX_PAGE_SIZE,
-    offset: number = 0,
-  ): Promise<Lyrics[]> {
-    const { genre, decade } = category;
-    const cacheKey = `${cacheConfig.keys.category}${genre ?? ''}:${decade ?? ''}:${limit}:${offset}`;
-
-    return this.getOrLoad(cacheKey, this.cacheTtlMs, async () => {
-      const query = this.lyricsRepository
-        .createQueryBuilder('lyrics')
-        .leftJoinAndSelect('lyrics.createdBy', 'user')
-        .where('lyrics.isActive = :isActive', { isActive: true });
-
-      if (genre) {
-        const validGenres = Object.values(Genre);
-        if (!validGenres.includes(genre as Genre)) {
-          throw new BadRequestException(
-            `Invalid genre. Valid genres are: ${validGenres.join(', ')}`,
-          );
-        }
-        query.andWhere('lyrics.genre = :genre', { genre });
-      } else if (decade) {
-        if (
-          decade < 1900 ||
-          decade > new Date().getFullYear() ||
-          decade % 10 !== 0
-        ) {
-          throw new BadRequestException(
-            'Invalid decade. Please provide a 4-digit year in decades (e.g., 1990, 2000, 2010)',
-          );
-        }
-        query.andWhere('lyrics.decade = :decade', { decade: decade.toString() });
-      }
-
-      return query
-        .orderBy('lyrics.id', 'ASC')
-        .take(limit)
-        .skip(offset)
-        .getMany();
-    });
-  }
-
-  /**
-   * Search active lyrics by artist, song title or snippet. The term is
-   * matched case-insensitively against the songTitle column.
-   */
-  async searchLyrics(
-    term: string,
-    limit: number = MAX_PAGE_SIZE,
-    offset: number = 0,
-  ): Promise<Lyrics[]> {
-    const trimmed = (term ?? '').trim();
-    if (!trimmed) {
-      throw new BadRequestException('Search term must not be empty');
-    }
-
-    const cacheKey = `${cacheConfig.keys.search}${trimmed.toLowerCase()}:${limit}:${offset}`;
-
-    return this.getOrLoad(cacheKey, this.cacheTtlMs, async () => {
-      return this.lyricsRepository
-        .createQueryBuilder('lyrics')
-        .leftJoinAndSelect('lyrics.createdBy', 'user')
-        .where('lyrics.isActive = :isActive', { isActive: true })
-        .andWhere(
-          '(lyrics.songTitle ILIKE :term OR lyrics.artist ILIKE :term OR lyrics.lyricSnippet ILIKE :term)',
-          { term: `%${trimmed}%` },
-        )
-        .orderBy('lyrics.id', 'ASC')
-        .take(limit)
-        .skip(offset)
-        .getMany();
-    });
-  }
-
-  /**
-   * Count lyrics, optionally restricted to active (or inactive) rows.
-   */
-  async count(isActive?: boolean): Promise<number> {
-    const where = isActive === undefined ? {} : { isActive };
-    return this.lyricsRepository.count({ where });
-  }
-
-  /**
-   * Restore a soft-deleted lyric by setting isActive back to true.
-   */
-  async restore(id: number): Promise<Lyrics> {
-    if (!id || id <= 0) {
-      throw new BadRequestException('Invalid lyrics ID');
-    }
-
-    const lyrics = await this.lyricsRepository.findOne({ where: { id } });
-
-    if (!lyrics) {
-      throw new NotFoundException('Lyrics not found');
-    }
-
-    lyrics.isActive = true;
-    const restored = await this.lyricsRepository.save(lyrics);
-
-    await this.clearCache();
-
-    return restored;
-  }
-
-  /**
-   * Find a lyric by its artist and song title (case-insensitive).
-   */
-  async findByArtistAndTitle(
-    artist: string,
-    songTitle: string,
-  ): Promise<Lyrics | null> {
-    if (!artist || !songTitle) {
-      throw new BadRequestException('artist and songTitle are required');
-    }
-
-    return this.lyricsRepository
-      .createQueryBuilder('lyrics')
-      .leftJoinAndSelect('lyrics.createdBy', 'user')
-      .where('lyrics.isActive = :isActive', { isActive: true })
-      .andWhere('LOWER(lyrics.artist) = LOWER(:artist)', { artist })
-      .andWhere('LOWER(lyrics.songTitle) = LOWER(:songTitle)', { songTitle })
-      .getOne();
-  }
-
-  /**
-   * Drop every lyrics cache entry this service has written.
-   */
-  async clearCache(): Promise<void> {
-    this.cacheGeneration += 1;
-
-    const now = Date.now();
-    const deletions: Promise<unknown>[] = [];
-
-    for (const [key, expiresAt] of this.cachedKeys) {
-      if (expiresAt > now) {
-        deletions.push(this.cacheManager.del(key));
-      }
-      this.cachedKeys.delete(key);
-    }
-
-    await Promise.all(deletions);
-  }
-
-  /**
-   * Alias of clearCache() for callers that use invalidation terminology.
-   */
-  async invalidateCache(): Promise<void> {
-    return this.clearCache();
-  }
-
-  /**
-   * Report how many cache keys are live, grouped by key type.
-   */
-  async getCacheStats(): Promise<LyricsCacheStats> {
-    const now = Date.now();
-    const keysByType = {
-      lyrics: 0,
-      random: 0,
-      category: 0,
-      search: 0,
-    };
-
-    for (const [key, expiresAt] of this.cachedKeys) {
-      if (expiresAt <= now) {
-        continue;
-      }
-      if (key.startsWith(cacheConfig.keys.lyrics)) {
-        keysByType.lyrics += 1;
-      } else if (key.startsWith(cacheConfig.keys.random)) {
-        keysByType.random += 1;
-      } else if (key.startsWith(cacheConfig.keys.category)) {
-        keysByType.category += 1;
-      } else if (key.startsWith(cacheConfig.keys.search)) {
-        keysByType.search += 1;
-      }
-    }
-
-    return {
-      keys: Object.values(keysByType).reduce((sum, n) => sum + n, 0),
-      keysByType,
-      ttlMs: this.cacheTtlMs,
-    };
-  }
-}
+/* … truncated 8616 chars — edit only what you need near the top … */
