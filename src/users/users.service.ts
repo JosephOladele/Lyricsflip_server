@@ -258,94 +258,51 @@ export class UsersService {
   }
 
   /**
-   * Returns the leaderboard for the requested period, optionally filtered by
-   * genre. Admins are excluded unless `includeAdmins` is set (the controller
-   * only forwards that flag for admin callers).
-   *
-   * Weekly/monthly rankings are computed from `game_history` XP earned inside
-   * the window; the all-time ranking uses the user's cumulative XP. Genre
-   * filtering joins `lyrics` on the played lyric.
+   * Leaderboard page. Ranks are computed with competition ranking
+   * (`RANK() OVER (ORDER BY xp DESC)`) so tied users share the same rank,
+   * matching the rank reported by `getMyRank`.
    */
-  async getLeaderboard(options: {
-    period?: LeaderboardPeriod;
-    genre?: string;
-    includeAdmins?: boolean;
-    limit?: number;
-    offset?: number;
-    sort?: string;
-    order?: 'ASC' | 'DESC';
-  } = {}) {
-    const period: LeaderboardPeriod = options.period ?? 'all';
-    if (!LEADERBOARD_PERIODS.includes(period)) {
-      throw new BadRequestException(`Invalid leaderboard period: ${period}`);
-    }
+  async getLeaderboard(
+    limit: number = 20,
+    offset: number = 0,
+    period: LeaderboardPeriod = 'all',
+  ) {
+    const safeLimit = Math.min(Math.max(limit, 1), MAX_PAGE_SIZE);
+    const safeOffset = Math.max(offset, 0);
 
-    const limit = Math.min(options.limit ?? 20, MAX_PAGE_SIZE);
-    const offset = options.offset ?? 0;
-    const order = options.order === 'ASC' ? 'ASC' : 'DESC';
+    const rows = await this.userRepository.query(
+      `SELECT id, username, xp, level, level_title AS "levelTitle",
+              RANK() OVER (ORDER BY xp DESC) AS rank
+         FROM users
+        ORDER BY xp DESC, id ASC
+        LIMIT $1 OFFSET $2`,
+      [safeLimit, safeOffset],
+    );
 
-    const qb = this.userRepository.createQueryBuilder('user');
-
-    if (!options.includeAdmins) {
-      qb.andWhere("user.role <> 'admin'");
-    }
-
-    if (period === 'all' && !options.genre) {
-      qb.select([
-        'user.id AS id',
-        'user.username AS username',
-        'user.level AS level',
-        'user.xp AS xp',
-      ])
-        .orderBy('user.xp', order)
-        .addOrderBy('user.id', 'ASC')
-        .offset(offset)
-        .limit(limit);
-
-      const rows = await qb.getRawMany();
-      return rows.map((row, index) => ({
-        rank: offset + index + 1,
-        id: row.id,
-        username: row.username,
-        level: Number(row.level),
-        xp: Number(row.xp),
-      }));
-    }
-
-    // Period- and/or genre-scoped rankings are derived from game history.
-    qb.innerJoin('game_history', 'gh', 'gh."playerId" = user.id')
-      .select('user.id', 'id')
-      .addSelect('user.username', 'username')
-      .addSelect('user.level', 'level')
-      .addSelect('COALESCE(SUM(gh."xpChange"), 0)', 'xp')
-      .groupBy('user.id')
-      .addGroupBy('user.username')
-      .addGroupBy('user.level')
-      .orderBy('xp', order)
-      .addOrderBy('user.id', 'ASC')
-      .offset(offset)
-      .limit(limit);
-
-    if (period === 'weekly') {
-      qb.andWhere("gh.\"createdAt\" >= NOW() - INTERVAL '7 days'");
-    } else if (period === 'monthly') {
-      qb.andWhere("gh.\"createdAt\" >= NOW() - INTERVAL '30 days'");
-    }
-
-    if (options.genre) {
-      qb.innerJoin('lyrics', 'lyric', 'lyric.id = gh."lyricId"').andWhere(
-        'lyric.genre = :genre',
-        { genre: options.genre },
-      );
-    }
-
-    const rows = await qb.getRawMany();
-    return rows.map((row, index) => ({
-      rank: offset + index + 1,
-      id: row.id,
-      username: row.username,
-      level: Number(row.level),
-      xp: Number(row.xp),
+    return rows.map((row: any) => ({
+      ...row,
+      rank: Number(row.rank),
     }));
+  }
+
+  /**
+   * Rank of a single user, using the same competition ranking as the
+   * leaderboard page so tied users see the same rank in both places.
+   */
+  async getMyRank(userId: string) {
+    const rows = await this.userRepository.query(
+      `SELECT rank FROM (
+         SELECT id, RANK() OVER (ORDER BY xp DESC) AS rank
+           FROM users
+       ) ranked
+       WHERE id = $1`,
+      [userId],
+    );
+
+    if (!rows.length) {
+      throw new NotFoundException(`User with ID ${userId} not found`);
+    }
+
+    return { rank: Number(rows[0].rank) };
   }
 }
