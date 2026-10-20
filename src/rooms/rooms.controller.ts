@@ -12,9 +12,9 @@ import { ApiTags, ApiOperation, ApiResponse, ApiQuery } from '@nestjs/swagger';
 import { RoomsService } from './rooms.service';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { GuessLyricDto } from './dto/guess-lyric.dto';
+import { ListRoomsQueryDto } from './dto/list-rooms-query.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { GetUser } from '../auth/decorators/user.decorator';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 
 @ApiTags('rooms')
 @Controller('rooms')
@@ -65,16 +65,13 @@ export class RoomsController {
   @ApiQuery({ name: 'status', required: false, enum: ['lobby'], description: 'Filter by room status' })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Items per page (default 20, max 100)' })
   @ApiQuery({ name: 'offset', required: false, type: Number, description: 'Number of items to skip (default 0)' })
-  async findOpenRooms(
-    @Query('status') status: string,
-    @Query() pagination: PaginationQueryDto,
-  ) {
+  async findOpenRooms(@Query() query: ListRoomsQueryDto) {
     // Only support status=lobby for now
-    if (status && status !== 'lobby') {
+    if (query.status && query.status !== 'lobby') {
       return { items: [], total: 0 };
     }
-    const limit = pagination.limit ?? 20;
-    const offset = pagination.offset ?? 0;
+    const limit = query.limit ?? 20;
+    const offset = query.offset ?? 0;
     return this.roomsService.findOpenRooms(limit, offset);
   }
 
