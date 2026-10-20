@@ -132,7 +132,8 @@ export class AdminController {
     @GetUser() user: User,
   ) {
     const dryRun = body?.dryRun === true || body?.dryRun === 'true';
-    return this.adminService.importLyrics(file, dryRun, user);
+    const mode = body?.mode === 'create-only' ? 'create-only' : 'upsert';
+    return this.adminService.importLyrics(file, dryRun, user, mode);
   }
 
   @Post('lyrics/:id/restore')
