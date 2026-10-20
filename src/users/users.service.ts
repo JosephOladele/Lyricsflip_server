@@ -258,317 +258,94 @@ export class UsersService {
   }
 
   /**
-   * Self-service account deletion. Re-authenticates the caller with their
-   * current password before delegating to the anonymizing `remove`. A wrong
-   * password throws 401 and leaves the account untouched.
-   */
-  async deleteAccount(userId: string, password: string) {
-    const user = await this.userRepository.findOne({
-      where: { id: userId },
-      select: ['id', 'password'],
-    });
-    if (!user) {
-      throw new NotFoundException(`User with ID ${userId} not found`);
-    }
-
-    const matches =
-      typeof user.password === 'string' &&
-      user.password.length > 0 &&
-      (await bcrypt.compare(password, user.password));
-    if (!matches) {
-      throw new UnauthorizedException('Invalid password');
-    }
-
-    return this.remove(userId);
-  }
-
-  /**
-   * Exports all personal data held for a user as a JSON-serialisable bundle.
-   * Includes the profile, game history and wagers so the user can satisfy
-   * data-portability requests (GDPR/NDPR).
-   */
-  async exportData(id: string) {
-    const user = await this.findOne(id);
-
-    const wagers = await this.wagerRepository.find({
-      where: [{ playerAId: id }, { playerBId: id }],
-      order: { createdAt: 'DESC' },
-    });
-
-    const gameHistory = await this.userRepository.manager
-      .getRepository('GameHistory')
-      .find({ where: { userId: id } })
-      .catch(() => []);
-
-    return {
-      exportedAt: new Date().toISOString(),
-      profile: {
-        id: user.id,
-        email: user.email,
-        username: user.username,
-        name: user.name,
-        stellarAddress: user.stellarAddress,
-        preferredGenre: user.preferredGenre,
-        preferredDecade: user.preferredDecade,
-        xp: user.xp,
-        level: user.level,
-        isActive: user.isActive,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-      },
-      gameHistory,
-      wagers,
-    };
-  }
-
-  /**
-   * Update user preferences (genre and decade)
-   * @param userId The ID of the user to update
-   * @param preferencesDto The preferences to update
-   * @returns Updated user with preferences
-   */
-  async updatePreferences(
-    userId: string,
-    preferencesDto: UpdateUserPreferencesDto,
-  ): Promise<User> {
-    const user = await this.userRepository.findOne({ where: { id: userId } });
-    if (!user) {
-      throw new NotFoundException(`User with ID ${userId} not found`);
-    }
-
-    // Update only the provided preferences
-    if (preferencesDto.preferredGenre !== undefined) {
-      user.preferredGenre = preferencesDto.preferredGenre;
-    }
-    if (preferencesDto.preferredDecade !== undefined) {
-      user.preferredDecade = preferencesDto.preferredDecade;
-    }
-
-    // Clear cache for this user if needed
-    await this.cacheManager.del(`user:${userId}`);
-
-    return this.userRepository.save(user);
-  }
-
-  /**
-   * Get user preferences
-   * @param userId The ID of the user
-   * @returns User preferences
-   */
-  async getUserPreferences(
-    userId: string,
-  ): Promise<{ preferredGenre?: string; preferredDecade?: string }> {
-    const user = await this.userRepository.findOne({
-      where: { id: userId },
-      select: ['preferredGenre', 'preferredDecade'],
-    });
-
-    if (!user) {
-      throw new NotFoundException(`User with ID ${userId} not found`);
-    }
-
-    return {
-      preferredGenre: user.preferredGenre,
-      preferredDecade: user.preferredDecade,
-    };
-  }
-
-  /**
-   * Returns the leaderboard: top users sorted by a field.
+   * Returns the leaderboard for the requested period, optionally filtered by
+   * genre. Admins are excluded unless `includeAdmins` is set (the controller
+   * only forwards that flag for admin callers).
    *
-   * Only active, non-admin accounts are ranked. When a `period` other than
-   * `all` is requested the ranking is derived from `game_history` aggregates
-   * within the period window (weekly = last 7 days, monthly = last 30 days),
-   * otherwise lifetime XP is used. Results are cached per query shape.
-   *
-   * @param limit number of users to return
-   * @param offset offset for pagination
-   * @param sort sort field (xp, level, username)
-   * @param order sort order (ASC, DESC)
-   * @param period ranking window (weekly, monthly, all)
-   * @param genre optional genre filter applied to game history
-   * @param currentUserId optional caller id used to compute "my rank"
+   * Weekly/monthly rankings are computed from `game_history` XP earned inside
+   * the window; the all-time ranking uses the user's cumulative XP. Genre
+   * filtering joins `lyrics` on the played lyric.
    */
   async getLeaderboard(options: {
+    period?: LeaderboardPeriod;
+    genre?: string;
+    includeAdmins?: boolean;
     limit?: number;
     offset?: number;
     sort?: string;
     order?: 'ASC' | 'DESC';
-    period?: LeaderboardPeriod;
-    genre?: string;
-    currentUserId?: string;
   } = {}) {
-    const {
-      limit = 10,
-      offset = 0,
-      sort = 'xp',
-      order = 'DESC',
-      period = 'all',
-      genre,
-      currentUserId,
-    } = options;
-    // Number.isInteger also rejects NaN, which slips past `limit < 1`.
-    if (
-      !Number.isInteger(limit) ||
-      !Number.isInteger(offset) ||
-      limit < 1 ||
-      limit > MAX_PAGE_SIZE ||
-      offset < 0
-    )
-      throw new BadRequestException('Invalid limit or offset');
-    const validSorts = ['xp', 'level', 'username'];
-    if (!validSorts.includes(sort))
-      throw new BadRequestException('Invalid sort field');
-    if (!['ASC', 'DESC'].includes(order))
-      throw new BadRequestException('Invalid order');
-    if (!LEADERBOARD_PERIODS.includes(period))
-      throw new BadRequestException('Invalid period');
-
-    const cacheKey = `leaderboard:${sort}:${order}:${period}:${genre ?? 'all'}:${limit}:${offset}`;
-    const cached = await this.cacheManager.get<any>(cacheKey);
-    if (cached) {
-      return currentUserId
-        ? { ...cached, myRank: await this.getMyRank(currentUserId, period, genre) }
-        : cached;
+    const period: LeaderboardPeriod = options.period ?? 'all';
+    if (!LEADERBOARD_PERIODS.includes(period)) {
+      throw new BadRequestException(`Invalid leaderboard period: ${period}`);
     }
 
-    const qb = this.userRepository
-      .createQueryBuilder('user')
-      .where('user.isActive = :isActive', { isActive: true })
-      .andWhere('user.isAdmin = :isAdmin', { isAdmin: false });
+    const limit = Math.min(options.limit ?? 20, MAX_PAGE_SIZE);
+    const offset = options.offset ?? 0;
+    const order = options.order === 'ASC' ? 'ASC' : 'DESC';
 
-    if (period !== 'all') {
-      const since = new Date();
-      since.setDate(since.getDate() - (period === 'weekly' ? 7 : 30));
+    const qb = this.userRepository.createQueryBuilder('user');
 
-      qb.innerJoin(
-        'game_history',
-        'gh',
-        'gh.userId = user.id AND gh.createdAt >= :since',
-        { since },
-      );
-      if (genre) {
-        qb.andWhere('gh.genre = :genre', { genre });
-      }
-      qb.addSelect('COALESCE(SUM(gh.xpEarned), 0)', 'periodXp')
-        .groupBy('user.id')
-        .orderBy('periodXp', order)
-        .addOrderBy('user.id', 'ASC');
-    } else {
-      qb.orderBy(`user.${sort}`, order).addOrderBy('user.id', 'ASC');
+    if (!options.includeAdmins) {
+      qb.andWhere("user.role <> 'admin'");
     }
 
-    const total = await qb.getCount();
-    const rows = await qb
-      .select([
+    if (period === 'all' && !options.genre) {
+      qb.select([
         'user.id AS id',
         'user.username AS username',
-        'user.xp AS xp',
         'user.level AS level',
+        'user.xp AS xp',
       ])
-      .offset(offset)
-      .limit(limit)
-      .getRawMany<{
-        id: string;
-        username: string;
-        xp: number;
-        level: number;
-        periodXp?: string;
-      }>();
+        .orderBy('user.xp', order)
+        .addOrderBy('user.id', 'ASC')
+        .offset(offset)
+        .limit(limit);
 
-    const data = rows.map((row, idx) => ({
+      const rows = await qb.getRawMany();
+      return rows.map((row, index) => ({
+        rank: offset + index + 1,
+        id: row.id,
+        username: row.username,
+        level: Number(row.level),
+        xp: Number(row.xp),
+      }));
+    }
+
+    // Period- and/or genre-scoped rankings are derived from game history.
+    qb.innerJoin('game_history', 'gh', 'gh."playerId" = user.id')
+      .select('user.id', 'id')
+      .addSelect('user.username', 'username')
+      .addSelect('user.level', 'level')
+      .addSelect('COALESCE(SUM(gh."xpChange"), 0)', 'xp')
+      .groupBy('user.id')
+      .addGroupBy('user.username')
+      .addGroupBy('user.level')
+      .orderBy('xp', order)
+      .addOrderBy('user.id', 'ASC')
+      .offset(offset)
+      .limit(limit);
+
+    if (period === 'weekly') {
+      qb.andWhere("gh.\"createdAt\" >= NOW() - INTERVAL '7 days'");
+    } else if (period === 'monthly') {
+      qb.andWhere("gh.\"createdAt\" >= NOW() - INTERVAL '30 days'");
+    }
+
+    if (options.genre) {
+      qb.innerJoin('lyrics', 'lyric', 'lyric.id = gh."lyricId"').andWhere(
+        'lyric.genre = :genre',
+        { genre: options.genre },
+      );
+    }
+
+    const rows = await qb.getRawMany();
+    return rows.map((row, index) => ({
+      rank: offset + index + 1,
       id: row.id,
       username: row.username,
-      xp: period === 'all' ? Number(row.xp) : Number(row.periodXp ?? 0),
       level: Number(row.level),
-      rank: offset + idx + 1,
+      xp: Number(row.xp),
     }));
-
-    const result = {
-      data,
-      meta: {
-        total,
-        limit,
-        offset,
-        sort,
-        order,
-        period,
-        genre: genre ?? null,
-      },
-    };
-
-    await this.cacheManager.set(
-      cacheKey,
-      result,
-      cacheConfig.leaderboardTtlMs,
-    );
-
-    if (currentUserId) {
-      return {
-        ...result,
-        myRank: await this.getMyRank(currentUserId, period, genre),
-      };
-    }
-    return result;
-  }
-
-  /**
-   * Computes the authenticated caller's rank for the given leaderboard window.
-   * Returns null when the caller is inactive, an admin, or unranked.
-   */
-  private async getMyRank(
-    userId: string,
-    period: LeaderboardPeriod,
-    genre?: string,
-  ): Promise<{ rank: number; xp: number } | null> {
-    const user = await this.userRepository.findOne({
-      where: { id: userId },
-      select: ['id', 'xp', 'isActive', 'isAdmin'],
-    });
-    if (!user || !user.isActive || user.isAdmin) {
-      return null;
-    }
-
-    if (period === 'all') {
-      const higher = await this.userRepository.count({
-        where: { isActive: true, isAdmin: false, xp: Not(user.xp) },
-      });
-      const ahead = await this.userRepository
-        .createQueryBuilder('user')
-        .where('user.isActive = :isActive', { isActive: true })
-        .andWhere('user.isAdmin = :isAdmin', { isAdmin: false })
-        .andWhere('user.xp > :xp', { xp: user.xp })
-        .getCount();
-      return { rank: ahead + 1, xp: user.xp };
-    }
-
-    const since = new Date();
-    since.setDate(since.getDate() - (period === 'weekly' ? 7 : 30));
-
-    const qb = this.userRepository
-      .createQueryBuilder('user')
-      .innerJoin(
-        'game_history',
-        'gh',
-        'gh.userId = user.id AND gh.createdAt >= :since',
-        { since },
-      )
-      .where('user.isActive = :isActive', { isActive: true })
-      .andWhere('user.isAdmin = :isAdmin', { isAdmin: false });
-    if (genre) {
-      qb.andWhere('gh.genre = :genre', { genre });
-    }
-    qb.select('user.id', 'id')
-      .addSelect('COALESCE(SUM(gh.xpEarned), 0)', 'periodXp')
-      .groupBy('user.id');
-
-    const rows = await qb.getRawMany<{ id: string; periodXp: string }>();
-    const mine = rows.find((row) => row.id === userId);
-    if (!mine) {
-      return null;
-    }
-    const myXp = Number(mine.periodXp);
-    const rank = rows.filter((row) => Number(row.periodXp) > myXp).length + 1;
-    return { rank, xp: myXp };
   }
 }
