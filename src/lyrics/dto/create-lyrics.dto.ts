@@ -18,15 +18,19 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 /**
  * DTO for creating a new Lyrics record.
  *
+ * This is the single source of truth for lyric validation, used by the
+ * controller, AdminService.importLyrics and the seed so that API and import
+ * reject the same invalid rows.
+ *
  * lyricSnippet behaviour
  * ----------------------
- * • If the client supplies lyricSnippet it is used as-is (1–300 chars).
+ * • If the client supplies lyricSnippet it is used as-is (1–150 chars).
  * • If the client omits lyricSnippet, LyricsService.create() derives one
  *   automatically by trimming `content` to its first 150 characters.
  *   This keeps every row's lyricSnippet non-empty while still letting
  *   callers override the default with a hand-picked excerpt.
  */
-export class CreateLyricsDto {
+export class CreateLyricDto {
   @ApiProperty({ description: 'Full lyrics content' })
   @IsString()
   @IsNotEmpty()
@@ -34,15 +38,15 @@ export class CreateLyricsDto {
 
   @ApiPropertyOptional({
     description:
-      'Short excerpt shown to players during gameplay (1–300 chars). ' +
+      'Short excerpt shown to players during gameplay (1–150 chars). ' +
       'When omitted the service derives one from the first 150 chars of content.',
     minLength: 1,
-    maxLength: 300,
+    maxLength: 150,
   })
   @IsOptional()
   @IsString()
   @MinLength(1)
-  @MaxLength(300)
+  @MaxLength(150)
   @Transform(({ value }) =>
     typeof value === 'string' ? value.trim() : value,
   )

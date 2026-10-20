@@ -1,4 +1,4 @@
 import { PartialType } from '@nestjs/mapped-types';
-import { CreateLyricsDto } from './create-lyrics.dto';
+import { CreateLyricDto } from './create-lyric.dto';
 
-export class UpdateLyricsDto extends PartialType(CreateLyricsDto) {}
+export class UpdateLyricDto extends PartialType(CreateLyricDto) {}
