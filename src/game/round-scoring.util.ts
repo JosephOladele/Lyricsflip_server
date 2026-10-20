@@ -8,11 +8,21 @@ export interface RoundScoreInput {
   elapsedMs: number;
   windowMs: number;
   hintsUsed: number;
+  /** Difficulty of the round, stored as 1–5. */
+  difficulty?: number;
+  /** Consecutive correct rounds before this one. */
+  streak?: number;
 }
 
 export interface RoundScore {
   points: number;
   speedBonus: number;
+  /** Streak bonus awarded for the current streak. */
+  streakBonus: number;
+  /** Difficulty multiplier applied to the round. */
+  difficultyMultiplier: number;
+  /** Points removed by hints. */
+  hintPenalty: number;
   /** The answer window had closed, so no points were earned. */
   timedOut: boolean;
 }
@@ -41,6 +51,17 @@ export function hintMultiplier(hintsUsed: number): number {
   return Math.max(100 - penalty, 0) / 100;
 }
 
+/**
+ * Maps a stored difficulty (1–5) to the configured multiplier. 1–2 are easy,
+ * 3 is medium and 4–5 are hard.
+ */
+export function difficultyMultiplier(difficulty: number): number {
+  const multipliers = GAME_CONSTANTS.POINTS.DIFFICULTY_MULTIPLIER;
+  if (difficulty <= 2) return multipliers.easy;
+  if (difficulty === 3) return multipliers.medium;
+  return multipliers.hard;
+}
+
 /** The most a round can still score with `hintsUsed` hints taken. */
 export function maxRoundPoints(hintsUsed: number): number {
   return Math.round(
@@ -51,24 +72,59 @@ export function maxRoundPoints(hintsUsed: number): number {
 }
 
 /**
- * Turns a matched guess into the points a round awards: base points plus the
- * speed bonus, reduced by hints, and nothing at all once the window is closed.
+ * Turns a matched guess into the points a round awards. Order of operations:
+ * base points plus the speed bonus, scaled by the difficulty multiplier, plus
+ * the streak bonus, then reduced by the hint penalty. Nothing is awarded once
+ * the window is closed or the guess is wrong.
  */
 export function scoreRound(input: RoundScoreInput): RoundScore {
-  const { basePoints, isCorrect, elapsedMs, windowMs, hintsUsed } = input;
+  const {
+    basePoints,
+    isCorrect,
+    elapsedMs,
+    windowMs,
+    hintsUsed,
+    difficulty = 3,
+    streak = 0,
+  } = input;
+
+  const multiplier = difficultyMultiplier(difficulty);
 
   if (elapsedMs > windowMs) {
-    return { points: 0, speedBonus: 0, timedOut: true };
+    return {
+      points: 0,
+      speedBonus: 0,
+      streakBonus: 0,
+      difficultyMultiplier: multiplier,
+      hintPenalty: 0,
+      timedOut: true,
+    };
   }
 
   if (!isCorrect) {
-    return { points: 0, speedBonus: 0, timedOut: false };
+    return {
+      points: 0,
+      speedBonus: 0,
+      streakBonus: 0,
+      difficultyMultiplier: multiplier,
+      hintPenalty: 0,
+      timedOut: false,
+    };
   }
 
   const speedBonus = computeSpeedBonus(basePoints, elapsedMs, windowMs);
-  const points = Math.round(
-    (basePoints + speedBonus) * hintMultiplier(hintsUsed),
-  );
+  const streakBonus =
+    streak > 0 ? GAME_CONSTANTS.POINTS.STREAK_BONUS * streak : 0;
+  const gross = Math.round((basePoints + speedBonus) * multiplier) + streakBonus;
+  const points = Math.round(gross * hintMultiplier(hintsUsed));
+  const hintPenalty = gross - points;
 
-  return { points, speedBonus, timedOut: false };
+  return {
+    points,
+    speedBonus,
+    streakBonus,
+    difficultyMultiplier: multiplier,
+    hintPenalty,
+    timedOut: false,
+  };
 }
