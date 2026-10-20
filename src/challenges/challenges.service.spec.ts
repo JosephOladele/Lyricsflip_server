@@ -9,6 +9,7 @@ describe('ChallengesService', () => {
 
   let attempts: any[];
   let stored: any;
+  let activeLyricIds: number[];
   const challengeRepo = {
     findOne: jest.fn(async () => stored),
     findOneOrFail: jest.fn(async () => stored),
@@ -34,7 +35,9 @@ describe('ChallengesService', () => {
     }),
   };
   const lyricsRepo = {
-    find: jest.fn(async () => [1, 2, 3, 4, 8, 15].map((id) => ({ id }))),
+    find: jest.fn(async () =>
+      activeLyricIds.map((id) => ({ id })),
+    ),
   };
   const game = {
     validateGuess: jest.fn(() => ({ isValid: true })),
@@ -63,6 +66,7 @@ describe('ChallengesService', () => {
     jest.clearAllMocks();
     attempts = [];
     stored = undefined;
+    activeLyricIds = [1, 2, 3, 4, 8, 15];
   });
 
   afterEach(() => jest.useRealTimers());
@@ -125,6 +129,27 @@ describe('ChallengesService', () => {
     expect(events.emit).toHaveBeenCalledWith(
       'user.completed_challenge',
       expect.objectContaining({ userId, streakCount: 3 }),
+    );
+  });
+
+  it('still completes the challenge when a lyric is deactivated mid-day', async () => {
+    stored = { date: day, lyricIds };
+    // Lyric 8 is deactivated after the day's set was drawn.
+    activeLyricIds = [1, 2, 3, 4, 15];
+    const svc = service();
+
+    for (const lyricId of [4, 15]) {
+      await svc.guess(userId, {
+        lyricId,
+        guessType: GuessType.ARTIST,
+        guessValue: 'Artist',
+      });
+    }
+
+    expect(events.emit).toHaveBeenCalledTimes(1);
+    expect(events.emit).toHaveBeenCalledWith(
+      'user.completed_challenge',
+      expect.objectContaining({ userId, streakCount: 2 }),
     );
   });
 });

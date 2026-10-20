@@ -120,6 +120,30 @@ export class ChallengesService {
     return challenge.lyricIds;
   }
 
+  /**
+   * The subset of the day's fixed lyric ids that are still active (playable).
+   *
+   * The day's set stays fixed in `daily_challenges.lyricIds`, but if an admin
+   * deactivates one of those lyrics mid-day it can no longer be guessed
+   * (`checkGuess` only loads active lyrics). To keep the challenge completable
+   * and `total` consistent with what is actually playable, both `total` and the
+   * completion check are computed from the still-active ids only. The lyric is
+   * simply excluded from today's playable set; tomorrow's draw is unaffected.
+   */
+  private async getActiveDailyLyricIds(
+    lyricIds: number[],
+  ): Promise<number[]> {
+    if (lyricIds.length === 0) return [];
+
+    const active = await this.lyricsRepository.find({
+      where: { id: In(lyricIds), isActive: true },
+      select: ['id'],
+    });
+    const activeSet = new Set(active.map((lyric) => lyric.id));
+
+    return lyricIds.filter((id) => activeSet.has(id));
+  }
+
   /** Today's lyrics (never their answers) and the caller's progress on them. */
   async getDaily(userId: string): Promise<DailyChallengeView> {
     const date = utcDay();
@@ -157,7 +181,9 @@ export class ChallengesService {
       date,
       lyrics: view,
       attempted: attempts.length,
-      total: lyricIds.length,
+      // `total` reflects the playable lyrics only, so it matches the view and
+      // stays completable even if a lyric was deactivated mid-day.
+      total: view.length,
     };
   }
 
@@ -212,12 +238,19 @@ export class ChallengesService {
       await this.xpService.handleCorrectGuess(userId);
     }
 
-    const attempts = await this.attemptRepository.find({
-      where: { userId, challengeDate: date },
-    });
-    const completed = lyricIds.every((id) =>
-      attempts.some((attempt) => attempt.lyricId === id),
-    );
+    const [attempts, activeLyricIds] = await Promise.all([
+      this.attemptRepository.find({
+        where: { userId, challengeDate: date },
+      }),
+      this.getActiveDailyLyricIds(lyricIds),
+    ]);
+    // Completion only requires attempts on the still-active lyrics, so a lyric
+    // deactivated mid-day cannot make the challenge impossible to complete.
+    const completed =
+      activeLyricIds.length > 0 &&
+      activeLyricIds.every((id) =>
+        attempts.some((attempt) => attempt.lyricId === id),
+      );
 
     if (completed) {
       this.announceCompletion(userId, date, attempts);
@@ -274,19 +307,17 @@ export class ChallengesService {
     date: string,
     attempts: DailyChallengeAttempt[],
   ): void {
-    const correct = attempts.filter((attempt) => attempt.isCorrect).length;
     const points = attempts.reduce((sum, attempt) => sum + attempt.points, 0);
+    const correct = attempts.filter((attempt) => attempt.isCorrect).length;
 
     const payload: ChallengeCompletedNotificationPayload = {
       userId,
-      timestamp: new Date(),
-      message: `You finished the ${date} daily challenge: ${correct} of ${attempts.length} correct, ${points} points.`,
-      challengeName: `Daily challenge ${date}`,
-      streakCount: correct,
-      reward: `${points} points`,
+      challengeDate: date,
+      points,
+      correct,
+      total: attempts.length,
     };
 
-    this.logger.log(`User ${userId} completed the ${date} daily challenge`);
     this.events.emit('user.completed_challenge', payload);
   }
 }
