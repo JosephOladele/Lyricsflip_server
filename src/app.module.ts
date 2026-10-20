@@ -208,22 +208,34 @@ import type { LoggingOptions } from 'typeorm';
     NotificationsModule,
     XpModule,
     AuditModule,
-    HealthModule,
     MetricsModule,
   ],
   controllers: [AppController],
   providers: [
-    { provide: APP_FILTER, useClass: AllExceptionsFilter },
-    { provide: APP_GUARD, useClass: AppThrottlerGuard },
-    { provide: APP_GUARD, useClass: JwtAuthGuard },
-    { provide: APP_GUARD, useClass: RolesGuard },
-    { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: AppThrottlerGuard,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: LoggingInterceptor,
+    },
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter,
+    },
   ],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    // Reads or generates x-request-id for every request and stores it in
-    // AsyncLocalStorage so every Winston log line includes it (#200).
     consumer.apply(RequestIdMiddleware).forRoutes('*');
   }
 }
