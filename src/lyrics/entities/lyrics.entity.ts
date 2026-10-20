@@ -7,6 +7,7 @@ import {
   UpdateDateColumn,
   Index,
   Unique,
+  Check,
 } from "typeorm"
 import { User } from "../../users/entities/user.entity"
 import { Genre } from "./genre.enum"
@@ -18,6 +19,7 @@ export { Genre }
 
 @Entity()
 @Unique(["artist", "songTitle"]) // Combination uniqueness
+@Check('"difficulty" BETWEEN 1 AND 5')
 export class Lyrics {
   @PrimaryGeneratedColumn()
   id: number
@@ -56,7 +58,7 @@ export class Lyrics {
   @Index()
   decade: string
 
-  @Column({ type: "int", default: 0 })
+  @Column({ type: "int", default: 3 })
   difficulty: number // 1-5 scale
 
   @Column({ type: "boolean", default: true })
