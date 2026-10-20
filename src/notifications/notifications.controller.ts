@@ -1,5 +1,5 @@
-import { Controller, Post, Get, Delete, Body, Param, HttpCode, HttpStatus } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
+import { Controller, Post, Get, Delete, Body, Param, Query, HttpCode, HttpStatus, ParseIntPipe, DefaultValuePipe } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiBody, ApiQuery } from '@nestjs/swagger';
 import { NotificationsService } from './notifications.service';
 import { 
   CreateLevelUpNotificationDto, 
@@ -18,10 +18,42 @@ export class NotificationsController {
 
   @Get('me')
   @ApiOperation({ summary: "Get the caller's notifications" })
+  @ApiQuery({ name: 'page', required: false, type: Number })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'unread', required: false, type: Boolean })
   @ApiResponse({ status: 200, description: "Returns the caller's notifications" })
-  async getMyNotifications(@GetUser() user: User): Promise<{ notifications: any[] }> {
-    const notifications = this.notificationsService.getNotificationsForUser(user.id);
-    return { notifications };
+  async getMyNotifications(
+    @GetUser() user: User,
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+    @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
+    @Query('unread') unread?: string,
+  ): Promise<{ notifications: any[]; total: number; page: number; limit: number }> {
+    return this.notificationsService.getNotificationsForUser(user.id, {
+      page,
+      limit,
+      unreadOnly: unread === 'true' || unread === '1',
+    });
+  }
+
+  @Post('read-all')
+  @ApiOperation({ summary: "Mark all of the caller's notifications as read" })
+  @ApiResponse({ status: 200, description: 'Notifications marked as read' })
+  @HttpCode(HttpStatus.OK)
+  async markAllRead(@GetUser() user: User): Promise<{ updated: number }> {
+    const updated = await this.notificationsService.markAllAsRead(user.id);
+    return { updated };
+  }
+
+  @Post(':id/read')
+  @ApiOperation({ summary: 'Mark a single notification as read' })
+  @ApiResponse({ status: 200, description: 'Notification marked as read' })
+  @HttpCode(HttpStatus.OK)
+  async markRead(
+    @GetUser() user: User,
+    @Param('id') id: string,
+  ): Promise<{ notification: any }> {
+    const notification = await this.notificationsService.markAsRead(user.id, id);
+    return { notification };
   }
 
   @Roles(Role.Admin)
@@ -29,7 +61,7 @@ export class NotificationsController {
   @ApiOperation({ summary: 'Get notifications for a specific user' })
   @ApiResponse({ status: 200, description: 'Returns user notifications' })
   async getUserNotifications(@Param('userId') userId: string): Promise<{ notifications: any[] }> {
-    const notifications = this.notificationsService.getNotificationsForUser(userId);
+    const { notifications } = await this.notificationsService.getNotificationsForUser(userId);
     return { notifications };
   }
 
@@ -38,7 +70,7 @@ export class NotificationsController {
   @ApiOperation({ summary: 'Clear all stored notifications' })
   @ApiResponse({ status: 200, description: 'All notifications cleared' })
   async clearNotifications(): Promise<{ message: string }> {
-    this.notificationsService.clearNotifications();
+    await this.notificationsService.clearNotifications();
     return { message: 'All notifications cleared' };
   }
 }
@@ -59,7 +91,7 @@ export class NotificationsDevController {
   @ApiResponse({ status: 201, description: 'Level up notification emitted successfully' })
   @HttpCode(HttpStatus.CREATED)
   async emitMockLevelUp(@Body() dto: CreateLevelUpNotificationDto): Promise<{ message: string }> {
-    this.notificationsService.emitLevelUpEvent(dto);
+    await this.notificationsService.emitLevelUpEvent(dto);
     return { message: 'Level up notification emitted successfully' };
   }
 
@@ -69,7 +101,7 @@ export class NotificationsDevController {
   @ApiResponse({ status: 201, description: 'Challenge completed notification emitted successfully' })
   @HttpCode(HttpStatus.CREATED)
   async emitMockChallengeCompleted(@Body() dto: CreateChallengeNotificationDto): Promise<{ message: string }> {
-    this.notificationsService.emitChallengeCompletedEvent(dto);
+    await this.notificationsService.emitChallengeCompletedEvent(dto);
     return { message: 'Challenge completed notification emitted successfully' };
   }
 
@@ -79,7 +111,7 @@ export class NotificationsDevController {
   @ApiResponse({ status: 201, description: 'Achievement notification emitted successfully' })
   @HttpCode(HttpStatus.CREATED)
   async emitMockAchievement(@Body() dto: CreateAchievementNotificationDto): Promise<{ message: string }> {
-    this.notificationsService.emitAchievementEvent(dto);
+    await this.notificationsService.emitAchievementEvent(dto);
     return { message: 'Achievement notification emitted successfully' };
   }
 
@@ -88,7 +120,7 @@ export class NotificationsDevController {
   @ApiResponse({ status: 201, description: 'Mock notifications generated successfully' })
   @HttpCode(HttpStatus.CREATED)
   async generateMockData(): Promise<{ message: string }> {
-    this.notificationsService.generateMockNotifications();
+    await this.notificationsService.generateMockNotifications();
     return { message: 'Mock notifications generated successfully' };
   }
 
@@ -98,7 +130,7 @@ export class NotificationsDevController {
   @ApiResponse({ status: 201, description: 'Test level up notification emitted' })
   @HttpCode(HttpStatus.CREATED)
   async testLevelUp(): Promise<{ message: string }> {
-    this.notificationsService.emitLevelUpEvent({
+    await this.notificationsService.emitLevelUpEvent({
       userId: 'test-user-123',
       newLevel: 10,
       newTitle: 'Lyric Master',
@@ -112,7 +144,7 @@ export class NotificationsDevController {
   @ApiResponse({ status: 201, description: 'Test challenge notification emitted' })
   @HttpCode(HttpStatus.CREATED)
   async testChallenge(): Promise<{ message: string }> {
-    this.notificationsService.emitChallengeCompletedEvent({
+    await this.notificationsService.emitChallengeCompletedEvent({
       userId: 'test-user-123',
       challengeName: 'Speed Demon',
       streakCount: 10,
@@ -126,7 +158,7 @@ export class NotificationsDevController {
   @ApiResponse({ status: 201, description: 'Test achievement notification emitted' })
   @HttpCode(HttpStatus.CREATED)
   async testAchievement(): Promise<{ message: string }> {
-    this.notificationsService.emitAchievementEvent({
+    await this.notificationsService.emitAchievementEvent({
       userId: 'test-user-123',
       achievementType: 'speed_demon',
       achievementValue: 5,
@@ -134,4 +166,4 @@ export class NotificationsDevController {
     });
     return { message: 'Test achievement notification emitted' };
   }
-} 
+}
