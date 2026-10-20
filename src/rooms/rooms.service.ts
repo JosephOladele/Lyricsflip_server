@@ -279,16 +279,111 @@ export class RoomsService {
     userId: string,
     guessDto: GuessLyricDto,
   ): Promise<RoomGuessResult> {
+    const room = await this.roomRepository.findOne({
+      where: { id: roomId },
+      relations: ['lyric'],
+    });
+
+    if (!room) {
+      throw new NotFoundException('Room not found');
+    }
+
+    this.assertPlayable(room);
+
     const roomUser = await this.roomUserRepository.findOne({
       where: { roomId, userId },
-      relations: ['room', 'room.lyric'],
     });
 
     if (!roomUser) {
       throw new NotFoundException('User has not joined this room');
     }
 
-    if (roomUser.hasGuessed) {
-      throw new ConflictException('User
+    // Atomically claim the guess. Only one concurrent request can flip
+    // hasGuessed from false to true; the loser sees zero affected rows.
+    const claim = await this.roomUserRepository
+      .createQueryBuilder()
+      .update(RoomUser)
+      .set({ hasGuessed: true, guessedAt: () => 'now()' })
+      .where('id = :id AND "hasGuessed" = false', { id: roomUser.id })
+      .execute();
 
-/* … truncated 2450 chars — edit only what you need near the top … */
+    if (!claim.affected || claim.affected !== 1) {
+      // Already guessed (or lost the race). Do not reveal the answer.
+      throw new ConflictException('You have already guessed in this room');
+    }
+
+    const lyric = room.lyric;
+    const guessType = guessDto.guessType ?? GuessType.SONG_TITLE;
+    const guess = guessDto.guess;
+
+    const isCorrect = matchGuess(guess, lyric, guessType);
+    const score = isCorrect ? this.calculateScore(lyric, guessType) : 0;
+
+    // Persist the score now that the guess is claimed.
+    await this.roomUserRepository.update(roomUser.id, { score });
+
+    return {
+      roomId: room.id,
+      guessType,
+      guess,
+      isCorrect,
+      score,
+      correctAnswer: `${lyric.artist} - ${lyric.songTitle}`,
+      lyric: this.toLyricView(lyric, true),
+    };
+  }
+
+  private calculateScore(lyric: Lyrics, guessType: GuessType): number {
+    // Base score per guess type; kept simple and deterministic.
+    return guessType === GuessType.SONG_TITLE ? 100 : 50;
+  }
+
+  private toLyricView(lyric: Lyrics, reveal: boolean): RoomLyricView {
+    const view: RoomLyricView = {
+      id: lyric.id,
+      lyricSnippet: lyric.lyricSnippet,
+      category: lyric.category,
+      genre: lyric.genre,
+      decade: lyric.decade,
+    };
+    if (reveal) {
+      view.artist = lyric.artist;
+      view.songTitle = lyric.songTitle;
+    }
+    return view;
+  }
+
+  private toPlayerView(roomUser: RoomUser): RoomPlayerView {
+    return {
+      id: roomUser.userId,
+      username: roomUser.user?.username ?? null,
+      hasGuessed: roomUser.hasGuessed,
+      score: roomUser.score,
+    };
+  }
+
+  private assertPlayable(room: Room): void {
+    if (room.isClosed) {
+      throw new BadRequestException('Room is closed');
+    }
+    if (room.expiresAt && room.expiresAt.getTime() <= Date.now()) {
+      throw new BadRequestException('Room has expired');
+    }
+  }
+
+  @Cron(CronExpression.EVERY_HOUR)
+  async closeExpiredRooms(): Promise<void> {
+    const acquired = await this.jobLock.acquire('rooms:close-expired', 60_000);
+    if (!acquired) {
+      return;
+    }
+    try {
+      await this.roomRepository.update(
+        { isClosed: false, expiresAt: LessThanOrEqual(new Date()) },
+        { isClosed: true },
+      );
+    } finally {
+      await this.jobLock.release('rooms:close-expired');
+    }
+  }
+}
