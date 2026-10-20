@@ -256,47 +256,6 @@ export class LyricsService {
     Object.assign(lyrics, updateLyricsDto);
     lyrics.updatedAt = new Date(); // Assuming you have updatedAt field
 
-    if (updateLyricsDto.decade !== undefined && updateLyricsDto.decade !== null) {
-      lyrics.decade = normalizeDecade(updateLyricsDto.decade.toString());
-    }
+    if (
 
-    if (updateLyricsDto.lyricSnippet !== undefined) {
-      this.assertSnippetWithinLimit(updateLyricsDto.lyricSnippet.trim());
-    }
-
-    const updatedLyrics = await this.lyricsRepository.save(lyrics);
-
-    // The edited lyric may appear in any list, category, random or search
-    // result, so drop every lyrics cache entry, not just lyrics:{id}.
-    await this.clearCache();
-
-    return updatedLyrics;
-  }
-
-  async remove(id: number): Promise<void> {
-    // Fixed: should be number, not string
-    // Validate ID
-    if (!id || id <= 0) {
-      throw new BadRequestException('Invalid lyrics ID');
-    }
-
-    const lyrics = await this.lyricsRepository.findOne({
-      where: { id, isActive: true },
-    });
-
-    if (!lyrics) {
-      throw new NotFoundException('Lyrics not found');
-    }
-
-    // Soft delete by setting isActive to false instead of hard delete
-    lyrics.isActive = false;
-    await this.lyricsRepository.save(lyrics);
-
-    // Drop every lyrics cache entry that could still contain this lyric
-    await this.clearCache();
-  }
-
-  /**
-   * Normalise a value for alias comparison: lower-case, trim,
-
-/* … truncated 8616 chars — edit only what you need near the top … */
+/* … truncated 1342 chars — edit only what you need near the top … */
