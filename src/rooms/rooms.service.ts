@@ -58,6 +58,14 @@ export interface RoomGuessResult {
   lyric: RoomLyricView;
 }
 
+/**
+ * Unambiguous uppercase alphabet for room codes.
+ * Excludes 0/O and 1/I to avoid confusion when codes are read aloud or typed.
+ */
+const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const ROOM_CODE_LENGTH = 6;
+const ROOM_CODE_MAX_ATTEMPTS = 5;
+
 @Injectable()
 export class RoomsService {
   private readonly logger = new Logger(RoomsService.name);
@@ -96,39 +104,58 @@ export class RoomsService {
       lyric = foundLyric;
     }
 
-    // Generate a unique 6-character code
-    const code = this.generateRoomCode();
+    // Generate a unique 6-character code, retrying on unique violations.
+    let lastError: unknown;
+    for (let attempt = 0; attempt < ROOM_CODE_MAX_ATTEMPTS; attempt++) {
+      const code = this.generateRoomCode();
 
-    const room = this.roomRepository.create({
-      name: createRoomDto.name,
-      code,
-      lyric,
-      lyricId: lyric.id,
-      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours from now
-    } as Room);
+      const room = this.roomRepository.create({
+        name: createRoomDto.name,
+        code,
+        lyric,
+        lyricId: lyric.id,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours from now
+      } as Room);
 
-    return this.roomRepository.save(room);
+      try {
+        return await this.roomRepository.save(room);
+      } catch (error) {
+        if (this.isUniqueViolation(error)) {
+          lastError = error;
+          this.logger.warn(
+            `Room code collision on attempt ${attempt + 1}, retrying`,
+          );
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    this.logger.error('Failed to generate a unique room code', lastError as Error);
+    throw new ConflictException('Could not generate a unique room code');
   }
 
   /**
-   * Generates a unique 6-character alphanumeric code.
-   * Uses base36 encoding of random bytes for a short, URL-friendly code.
+   * Generates a 6-character uppercase code from an unambiguous alphabet.
+   * Uses crypto.randomInt for uniform, unbiased selection.
    */
   private generateRoomCode(): string {
-    // 3 bytes = 24 bits = up to ~16M combinations, encoded in base36 gives ~5 chars
-    // We'll use 4 bytes and take first 6 chars to be safe
-    const bytes = crypto.randomBytes(4);
-    // Convert to base36 (0-9, a-z) and ensure 6 characters
-    let code = bytes.toString('base64')
-      .replace(/[+/=]/g, '') // Remove base64 special chars
-      .toLowerCase()
-      .substring(0, 6);
-    
-    // If somehow shorter, pad with random chars
-    while (code.length < 6) {
-      code += Math.floor(Math.random() * 36).toString(36);
+    let code = '';
+    for (let i = 0; i < ROOM_CODE_LENGTH; i++) {
+      code += ROOM_CODE_ALPHABET[
+        crypto.randomInt(0, ROOM_CODE_ALPHABET.length)
+      ];
     }
-    return code.substring(0, 6);
+    return code;
+  }
+
+  /** Detects a Postgres unique-constraint violation (SQLSTATE 23505). */
+  private isUniqueViolation(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+    const err = error as { code?: string; driverError?: { code?: string } };
+    return err.code === '23505' || err.driverError?.code === '23505';
   }
 
   async join(roomId: string, userId: string) {
@@ -162,10 +189,11 @@ export class RoomsService {
 
   /**
    * Join a room using its short 6-character code instead of UUID.
+   * Codes are stored uppercase, so the input is uppercased before lookup.
    */
   async joinByCode(code: string, userId: string) {
     const room = await this.roomRepository.findOne({
-      where: { code: code.toUpperCase() },
+      where: { code: code.trim().toUpperCase() },
       relations: ['roomUsers', 'lyric'],
     });
 
