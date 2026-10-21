@@ -302,17 +302,8 @@ fn refund_emits_a_refund_event() {
 }
 
 #[test]
-fn default_config_has_no_fee() {
-    let s = setup(1_000);
-    let config = s.client.get_config();
-
-    assert_eq!(config.fee_bps, 0);
-    assert_eq!(config.max_fee_bps, MAX_FEE_BPS);
-    assert_eq!(config.fee_receiver, None);
-}
-
-#[test]
-fn zero_fee_pays_the_whole_pot_to_the_winner() {
+fn claim_refund_pays_each_player_after_the_deadline() {
+    use soroban_sdk::testutils::Ledger;
     let s = setup(1_000);
     let id = session(&s.env);
 
@@ -320,124 +311,119 @@ fn zero_fee_pays_the_whole_pot_to_the_winner() {
     s.client.stake(&id, &s.player_a);
     s.client.stake(&id, &s.player_b);
 
-    let payout = s.client.resolve(&id, &s.player_a);
+    // Move past the refund deadline.
+    let seq = s.env.ledger().sequence();
+    s.env.ledger().set_sequence_number(seq + REFUND_DEADLINE + 1);
 
-    assert_eq!(payout, 200);
-    assert_eq!(s.token.balance(&s.player_a), 1_100);
-    assert_eq!(s.token.balance(&s.contract_id), 0);
-}
-
-#[test]
-fn a_normal_fee_is_split_between_winner_and_receiver() {
-    let s = setup(1_000);
-    let id = session(&s.env);
-    let receiver = Address::generate(&s.env);
-
-    // 2.5% fee.
-    s.client.set_fee(&250, &Some(receiver.clone()));
-
-    s.client.open_pot(&id, &s.player_a, &s.player_b, &100);
-    s.client.stake(&id, &s.player_a);
-    s.client.stake(&id, &s.player_b);
-
-    let payout = s.client.resolve(&id, &s.player_a);
-
-    // 200 * 250 / 10_000 = 5 fee, 195 to the winner.
-    assert_eq!(payout, 195);
-    assert_eq!(s.token.balance(&s.player_a), 1_095);
-    assert_eq!(s.token.balance(&receiver), 5);
-    assert_eq!(s.token.balance(&s.contract_id), 0);
-}
-
-#[test]
-fn the_fee_is_capped() {
-    let s = setup(1_000);
-    let receiver = Address::generate(&s.env);
-
-    assert_eq!(
-        s.client.try_set_fee(&(MAX_FEE_BPS + 1), &Some(receiver.clone())),
-        Err(Ok(Error::FeeTooHigh))
-    );
-
-    // Exactly at the cap is allowed.
-    s.client.set_fee(&MAX_FEE_BPS, &Some(receiver.clone()));
-    assert_eq!(s.client.get_config().fee_bps, MAX_FEE_BPS);
-}
-
-#[test]
-fn a_non_zero_fee_requires_a_receiver() {
-    let s = setup(1_000);
-
-    assert_eq!(
-        s.client.try_set_fee(&250, &None),
-        Err(Ok(Error::FeeReceiverRequired))
-    );
-
-    // A zero fee with no receiver is fine.
-    s.client.set_fee(&0, &None);
-    assert_eq!(s.client.get_config().fee_bps, 0);
-}
-
-#[test]
-fn the_fee_rounds_down() {
-    let s = setup(1_000);
-    let id = session(&s.env);
-    let receiver = Address::generate(&s.env);
-
-    // 1% fee on a 200 pot = 2 exactly; use a stake that produces a remainder.
-    s.client.set_fee(&333, &Some(receiver.clone()));
-
-    s.client.open_pot(&id, &s.player_a, &s.player_b, &100);
-    s.client.stake(&id, &s.player_a);
-    s.client.stake(&id, &s.player_b);
-
-    let payout = s.client.resolve(&id, &s.player_a);
-
-    // 200 * 333 / 10_000 = 6.66 -> 6 fee, 194 to the winner.
-    assert_eq!(payout, 194);
-    assert_eq!(s.token.balance(&receiver), 6);
-    assert_eq!(s.token.balance(&s.player_a), 1_094);
-    assert_eq!(s.token.balance(&s.contract_id), 0);
-}
-
-#[test]
-fn refunds_are_never_charged_a_fee() {
-    let s = setup(1_000);
-    let id = session(&s.env);
-    let receiver = Address::generate(&s.env);
-
-    s.client.set_fee(&250, &Some(receiver.clone()));
-
-    s.client.open_pot(&id, &s.player_a, &s.player_b, &100);
-    s.client.stake(&id, &s.player_a);
-    s.client.stake(&id, &s.player_b);
-
-    s.client.refund(&id);
-
+    s.client.claim_refund(&id, &s.player_a);
     assert_eq!(s.token.balance(&s.player_a), 1_000);
+    assert_eq!(s.token.balance(&s.player_b), 900);
+
+    s.client.claim_refund(&id, &s.player_b);
     assert_eq!(s.token.balance(&s.player_b), 1_000);
-    assert_eq!(s.token.balance(&receiver), 0);
     assert_eq!(s.token.balance(&s.contract_id), 0);
 }
 
 #[test]
-fn resolve_emits_a_fee_event() {
+fn claim_refund_is_rejected_before_the_deadline() {
     let s = setup(1_000);
     let id = session(&s.env);
-    let receiver = Address::generate(&s.env);
-
-    s.client.set_fee(&250, &Some(receiver.clone()));
 
     s.client.open_pot(&id, &s.player_a, &s.player_b, &100);
     s.client.stake(&id, &s.player_a);
     s.client.stake(&id, &s.player_b);
+
+    assert_eq!(
+        s.client.try_claim_refund(&id, &s.player_a),
+        Err(Ok(Error::RefundNotAvailable))
+    );
+}
+
+#[test]
+fn a_player_cannot_claim_refund_twice() {
+    use soroban_sdk::testutils::Ledger;
+    let s = setup(1_000);
+    let id = session(&s.env);
+
+    s.client.open_pot(&id, &s.player_a, &s.player_b, &100);
+    s.client.stake(&id, &s.player_a);
+    s.client.stake(&id, &s.player_b);
+
+    let seq = s.env.ledger().sequence();
+    s.env.ledger().set_sequence_number(seq + REFUND_DEADLINE + 1);
+
+    s.client.claim_refund(&id, &s.player_a);
+
+    assert_eq!(
+        s.client.try_claim_refund(&id, &s.player_a),
+        Err(Ok(Error::AlreadyClaimed))
+    );
+}
+
+#[test]
+fn resolve_after_a_partial_claim_pays_the_remaining_stake() {
+    use soroban_sdk::testutils::Ledger;
+    let s = setup(1_000);
+    let id = session(&s.env);
+
+    s.client.open_pot(&id, &s.player_a, &s.player_b, &100);
+    s.client.stake(&id, &s.player_a);
+    s.client.stake(&id, &s.player_b);
+
+    let seq = s.env.ledger().sequence();
+    s.env.ledger().set_sequence_number(seq + REFUND_DEADLINE + 1);
+    s.client.claim_refund(&id, &s.player_a);
+
+    // The remaining stake is still resolvable to the winner.
+    let payout = s.client.resolve(&id, &s.player_b);
+    assert_eq!(payout, 100);
+    assert_eq!(s.token.balance(&s.player_b), 1_000);
+    assert_eq!(s.token.balance(&s.contract_id), 0);
+}
+
+#[test]
+fn only_the_admin_can_upgrade_and_migrate() {
+    let s = setup(1_000);
+    let stranger = Address::generate(&s.env);
+    let new_wasm = BytesN::<32>::random(&s.env);
+
+    // With auth mocked, the admin path succeeds.
+    s.client.upgrade(&new_wasm);
+    s.client.migrate(&1u32);
+
+    // Without auth, a stranger cannot drive either entry point.
+    s.env.set_auths(&[]);
+    assert!(s.client.try_upgrade(&new_wasm).is_err());
+    assert!(s.client.try_migrate(&1u32).is_err());
+    let _ = stranger;
+}
+
+#[test]
+fn the_admin_can_rotate_the_admin() {
+    let s = setup(1_000);
+    let new_admin = Address::generate(&s.env);
+
+    s.client.set_admin(&new_admin);
+
+    assert_eq!(s.client.get_config().admin, new_admin);
+}
+
+#[test]
+fn resolve_writes_the_pot_once() {
+    // Regression guard for the double-write in `resolve`: the pot key must be
+    // written exactly once (via `save_pot`), not once by `save_pot` and again
+    // by a raw `persistent().set`.
+    let s = setup(1_000);
+    let id = session(&s.env);
+
+    s.client.open_pot(&id, &s.player_a, &s.player_b, &100);
+    s.client.stake(&id, &s.player_a);
+    s.client.stake(&id, &s.player_b);
+
+    let before = s.env.storage().persistent().get(&DataKey::Pot(id.clone()));
     s.client.resolve(&id, &s.player_a);
+    let after = s.env.storage().persistent().get(&DataKey::Pot(id.clone()));
 
-    let events = s.env.events().all();
-    let topic_names: std::vec::Vec<_> = events
-        .iter()
-        .map(|(_, topics, _)| topics.get_unchecked(0))
-        .collect();
-
-    assert!(topic_names.contains(&soroban_sdk::symbol_short!("fee").into_val(&s.env)));
+    assert!(before.is_some());
+    assert_eq!(after.unwrap().status, PotStatus::Resolved);
 }
