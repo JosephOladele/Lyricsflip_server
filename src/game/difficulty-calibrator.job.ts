@@ -2,53 +2,60 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { ConfigService } from '@nestjs/config';
-import { GameSession } from '../game-sessions/entities/game-session.entity';
-import { JobLockService } from '../tokens/services/job-lock.service';
+import { Lyrics } from '../lyrics/entities/lyrics.entity';
 
 /**
- * DifficultyCalibratorJob
+ * Nightly difficulty calibration job.
  *
- * Periodically recalibrates the difficulty of active game sessions based on
- * recent completion statistics. Runs on a schedule and is guarded by a
- * Postgres advisory lock so that only one instance in a cluster performs the
- * calibration per tick.
+ * Recomputes each lyric's difficulty from aggregated gameplay history in a
+ * single `UPDATE ... FROM (SELECT ...)` statement instead of one findOne +
+ * update per lyric (N+1).
+ *
+ * NOTE: This job depends on `game_history` being populated by gameplay
+ * (issue 57). Until that lands the subquery yields no rows and the job is a
+ * no-op, so it is gated behind `CALIBRATION_ENABLED` and disabled by default.
  */
 @Injectable()
 export class DifficultyCalibratorJob {
   private readonly logger = new Logger(DifficultyCalibratorJob.name);
 
   constructor(
-    @InjectRepository(GameSession)
-    private readonly gameSessionRepository: Repository<GameSession>,
-    private readonly jobLockService: JobLockService,
-    private readonly configService: ConfigService,
+    @InjectRepository(Lyrics)
+    private readonly lyricsRepository: Repository<Lyrics>,
   ) {}
 
-  @Cron(CronExpression.EVERY_10_MINUTES)
-  async calibrateDifficulty(): Promise<void> {
-    if (this.configService.get<string>('JOBS_ENABLED', 'true') === 'false') {
+  @Cron(CronExpression.EVERY_DAY_AT_3AM)
+  async calibrate(): Promise<void> {
+    if (process.env.CALIBRATION_ENABLED !== 'true') {
+      this.logger.debug(
+        'Difficulty calibration disabled (awaiting game_history writes, issue 57)',
+      );
       return;
     }
 
-    await this.jobLockService.runExclusive('difficulty-calibrator', async () => {
-      this.logger.debug('Running difficulty calibration');
+    // Single statement: derive a per-lyric success rate from game_history and
+    // map it onto the 1–5 difficulty range, clamped to stay within bounds.
+    const result = await this.lyricsRepository.query(`
+      UPDATE "lyrics" AS l
+      SET "difficulty" = GREATEST(
+        1,
+        LEAST(5, ROUND(5 - (stats.rate * 4))::int)
+      )
+      FROM (
+        SELECT
+          gh."lyricId" AS "lyricId",
+          AVG(CASE WHEN gh."success" THEN 1.0 ELSE 0.0 END) AS rate
+        FROM "game_history" gh
+        GROUP BY gh."lyricId"
+      ) AS stats
+      WHERE l."id" = stats."lyricId"
+        AND l."difficulty" IS DISTINCT FROM GREATEST(
+          1,
+          LEAST(5, ROUND(5 - (stats.rate * 4))::int)
+        )
+    `);
 
-      const sessions = await this.gameSessionRepository.find({
-        where: { status: 'active' },
-      });
-
-      for (const session of sessions) {
-        // Calibration logic is intentionally conservative: only adjust when a
-        // session has accumulated enough plays to produce a meaningful signal.
-        if (!session.difficulty) {
-          continue;
-        }
-      }
-
-      this.logger.debug(
-        `Difficulty calibration completed for ${sessions.length} session(s)`,
-      );
-    });
+    const changed = Array.isArray(result) ? result.length : (result ?? 0);
+    this.logger.log(`Difficulty calibration updated ${changed} lyric(s)`);
   }
 }

@@ -132,7 +132,8 @@ export class GameController {
   })
   @Get('lyrics/multiple')
   async getMultipleRandomLyrics(
-    @Query(new ValidationPipe({ transform: true })) options: MultipleLyricsDto,
+    @Query(new ValidationPipe({ transform: true }))
+    { sessionId, ...options }: MultipleLyricsDto,
     @GetUser() user: User,
   ): Promise<GameLyricResponse[]> {
     this.logger.log(`Getting ${options.count} random lyrics`);
@@ -144,31 +145,40 @@ export class GameController {
     }
 
     try {
+      // Mirror the single-lyric endpoint: forward the player's preferences
+      // and seen window so the batch honours the same filters (#332).
       const lyrics = await this.gameLogicService.getMultipleRandomLyrics(
         options.count,
-        options,
+        {
+          ...options,
+          preferredGenre: this.toLyricGenre(user.preferredGenre),
+          preferredDecade: user.preferredDecade ?? undefined,
+          userId: user.id,
+        },
       );
 
-      return Promise.all(
-        lyrics.map(async (lyric) => {
-          const round = await this.gameLogicService.issueRound(
-            user.id,
-            lyric.id,
-          );
-
-          return {
-            roundId: round.id,
-            issuedAt: round.issuedAt,
-            expiresAt: round.expiresAt,
-            answerWindowSeconds: round.answerWindowSeconds,
-            id: lyric.id,
-            lyricSnippet: lyric.lyricSnippet,
-            category: lyric.category,
-            decade: lyric.decade,
-            genre: lyric.genre,
-          };
-        }),
+      // Issue all rounds in a single statement tied to the session.
+      const rounds = await this.gameLogicService.issueRounds(
+        user.id,
+        lyrics.map((lyric) => lyric.id),
+        sessionId,
       );
+
+      return lyrics.map((lyric, index) => {
+        const round = rounds[index];
+
+        return {
+          roundId: round.id,
+          issuedAt: round.issuedAt,
+          expiresAt: round.expiresAt,
+          answerWindowSeconds: round.answerWindowSeconds,
+          id: lyric.id,
+          lyricSnippet: lyric.lyricSnippet,
+          category: lyric.category,
+          decade: lyric.decade,
+          genre: lyric.genre,
+        };
+      });
     } catch (error) {
       this.logger.error('Error fetching multiple lyrics', error.stack);
       throw error;

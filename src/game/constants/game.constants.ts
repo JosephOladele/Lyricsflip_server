@@ -16,6 +16,17 @@ export const GAME_CONSTANTS = {
       medium: 1.5,
       hard: 2,
     },
+    /**
+     * Maps the stored 1-5 difficulty to a DIFFICULTY_MULTIPLIER key.
+     * 1-2 => easy, 3 => medium, 4-5 => hard.
+     */
+    DIFFICULTY_TIER: {
+      1: 'easy',
+      2: 'easy',
+      3: 'medium',
+      4: 'hard',
+      5: 'hard',
+    },
   },
   LIMITS: {
     MAX_LYRICS_PER_REQUEST: 20,
