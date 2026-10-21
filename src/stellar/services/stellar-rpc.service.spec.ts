@@ -445,4 +445,73 @@ describe('StellarRpcService', () => {
       expect(await service.isHealthy()).toBe(false);
     });
   });
+
+  describe('OpenTelemetry manual spans', () => {
+    it('records transaction_hash and attempt_count attributes on submit', async () => {
+      const mockSpan = {
+        setAttribute: jest.fn(),
+        setAttributes: jest.fn(),
+        setStatus: jest.fn(),
+        recordException: jest.fn(),
+        end: jest.fn(),
+      };
+      const api = require('@opentelemetry/api');
+      const getTracerSpy = jest.spyOn(api.trace, 'getTracer').mockReturnValue({
+        startSpan: jest.fn().mockReturnValue(mockSpan),
+      } as any);
+
+      jest.spyOn(rpc.Server.prototype, 'sendTransaction').mockResolvedValue({
+        status: 'PENDING',
+        hash: hashOf(transaction),
+      } as rpc.Api.SendTransactionResponse);
+      jest.spyOn(service, 'waitForConfirmation').mockResolvedValue({
+        hash: hashOf(transaction),
+        confirmed: true,
+      });
+
+      await service.submit(transaction);
+
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        'transaction_hash',
+        hashOf(transaction),
+      );
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('attempt_count', 1);
+      expect(mockSpan.end).toHaveBeenCalled();
+
+      getTracerSpy.mockRestore();
+    });
+
+    it('records transaction_hash and attempt_count attributes on waitForConfirmation', async () => {
+      const mockSpan = {
+        setAttribute: jest.fn(),
+        setAttributes: jest.fn(),
+        setStatus: jest.fn(),
+        recordException: jest.fn(),
+        end: jest.fn(),
+      };
+      const api = require('@opentelemetry/api');
+      const getTracerSpy = jest.spyOn(api.trace, 'getTracer').mockReturnValue({
+        startSpan: jest.fn().mockReturnValue(mockSpan),
+      } as any);
+
+      jest.spyOn(rpc.Server.prototype, 'pollTransaction').mockResolvedValue({
+        status: rpc.Api.GetTransactionStatus.SUCCESS,
+        ledger: 100,
+      } as rpc.Api.GetTransactionResponse);
+
+      await service.waitForConfirmation('test-tx-hash');
+
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        'transaction_hash',
+        'test-tx-hash',
+      );
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        'attempt_count',
+        expect.any(Number),
+      );
+      expect(mockSpan.end).toHaveBeenCalled();
+
+      getTracerSpy.mockRestore();
+    });
+  });
 });

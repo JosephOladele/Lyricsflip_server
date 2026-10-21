@@ -53,4 +53,38 @@ describe('WagerReconcileJob', () => {
     expect(repo.find).not.toHaveBeenCalled();
     expect(runner.release).toHaveBeenCalled();
   });
+
+  it('propagates root span context linked to the wager during reconciliation', async () => {
+    const api = require('@opentelemetry/api');
+    const mockSpan = {
+      setStatus: jest.fn(),
+      recordException: jest.fn(),
+      end: jest.fn(),
+    };
+    const startActiveSpanSpy = jest.fn((name, options, fn) => fn(mockSpan));
+    const tracerSpy = jest.spyOn(api.trace, 'getTracer').mockReturnValue({
+      startActiveSpan: startActiveSpanSpy,
+    } as any);
+    const withContextSpy = jest
+      .spyOn(api.context, 'with')
+      .mockImplementation((_ctx, fn: any) => fn());
+
+    wagers.reconcileWager.mockResolvedValue({ success: true, message: 'ok' });
+    await job.reconcileStuckWagers();
+
+    expect(startActiveSpanSpy).toHaveBeenCalledWith(
+      'job.wager_reconcile.run',
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          'wager.id': 'w1',
+          'session.id': 's1',
+        }),
+      }),
+      expect.any(Function),
+    );
+    expect(mockSpan.end).toHaveBeenCalled();
+
+    tracerSpy.mockRestore();
+    withContextSpy.mockRestore();
+  });
 });

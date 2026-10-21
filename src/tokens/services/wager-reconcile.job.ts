@@ -6,6 +6,36 @@ import { Counter, Gauge } from 'prom-client';
 import { Wager, WagerStatus } from '../entities/wager.entity';
 import { WagerService } from './wager.service';
 
+/** Runs an asynchronous task inside a fresh OpenTelemetry root span linked to the target wager. */
+export async function runWithRootSpan<T>(
+  spanName: string,
+  attributes: Record<string, any>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    const api = require('@opentelemetry/api');
+    const tracer = api.trace.getTracer('wager-jobs');
+    const rootContext = api.ROOT_CONTEXT;
+    return await api.context.with(rootContext, () => {
+      return tracer.startActiveSpan(spanName, { attributes }, async (span: any) => {
+        try {
+          const res = await fn();
+          span.setStatus?.({ code: 1 });
+          return res;
+        } catch (error) {
+          span.recordException?.(error);
+          span.setStatus?.({ code: 2, message: (error as Error).message });
+          throw error;
+        } finally {
+          span.end();
+        }
+      });
+    });
+  } catch {
+    return fn();
+  }
+}
+
 /** Arbitrary constant key for the Postgres advisory lock guarding the sweep. */
 export const WAGER_RECONCILE_LOCK_KEY = 7_139_001;
 
@@ -98,46 +128,57 @@ export class WagerReconcileJob {
       const state = this.attempts.get(wager.id) ?? { count: 0, nextAt: 0 };
       if (Date.now() < state.nextAt) continue;
 
-      try {
-        const result = await this.wagerService.reconcileWager(wager.sessionId);
-        if (result.success) {
-          this.attempts.delete(wager.id);
-          this.logger.log(`Wager ${wager.id} reconciled: ${result.message}`);
-          continue;
-        }
-      } catch (error) {
-        this.logger.warn(
-          `Reconcile of wager ${wager.id} threw: ${(error as Error).message}`,
-        );
-      }
+      await runWithRootSpan(
+        'job.wager_reconcile.run',
+        {
+          'wager.id': wager.id,
+          'wager_id': wager.id,
+          'session.id': wager.sessionId,
+          'session_id': wager.sessionId,
+        },
+        async () => {
+          try {
+            const result = await this.wagerService.reconcileWager(wager.sessionId);
+            if (result.success) {
+              this.attempts.delete(wager.id);
+              this.logger.log(`Wager ${wager.id} reconciled: ${result.message}`);
+              return;
+            }
+          } catch (error) {
+            this.logger.warn(
+              `Reconcile of wager ${wager.id} threw: ${(error as Error).message}`,
+            );
+          }
 
-      state.count += 1;
-      state.nextAt = Date.now() + baseDelayMs * 2 ** (state.count - 1);
-      this.attempts.set(wager.id, state);
+          state.count += 1;
+          state.nextAt = Date.now() + baseDelayMs * 2 ** (state.count - 1);
+          this.attempts.set(wager.id, state);
 
-      if (state.count >= maxAttempts) {
-        await this.wagerRepository.update(
-          { id: wager.id, status: WagerStatus.SETTLING },
-          {
-            status: WagerStatus.FAILED,
-            resultMessage: `Gave up reconciling after ${state.count} attempts; needs operator review`,
-          },
-        );
-        this.attempts.delete(wager.id);
-        this.reconcileGiveups.inc();
-        this.logger.error(
-          `ALERT: wager ${wager.id} (session ${wager.sessionId}) moved to FAILED after ${state.count} reconcile attempts`,
-        );
+          if (state.count >= maxAttempts) {
+            await this.wagerRepository.update(
+              { id: wager.id, status: WagerStatus.SETTLING },
+              {
+                status: WagerStatus.FAILED,
+                resultMessage: `Gave up reconciling after ${state.count} attempts; needs operator review`,
+              },
+            );
+            this.attempts.delete(wager.id);
+            this.reconcileGiveups.inc();
+            this.logger.error(
+              `ALERT: wager ${wager.id} (session ${wager.sessionId}) moved to FAILED after ${state.count} reconcile attempts`,
+            );
 
-        // Notify both players that their wager is stuck and needs attention.
-        try {
-          await this.wagerService.notifyWagerOutcome(wager, 'wager.needs_attention');
-        } catch (error) {
-          this.logger.warn(
-            `Failed to notify players of stuck wager ${wager.id}: ${(error as Error).message}`,
-          );
-        }
-      }
+            // Notify both players that their wager is stuck and needs attention.
+            try {
+              await this.wagerService.notifyWagerOutcome(wager, 'wager.needs_attention');
+            } catch (error) {
+              this.logger.warn(
+                `Failed to notify players of stuck wager ${wager.id}: ${(error as Error).message}`,
+              );
+            }
+          }
+        },
+      );
     }
   }
 

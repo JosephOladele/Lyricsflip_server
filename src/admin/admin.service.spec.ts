@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConflictException } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { UsersService } from '../users/users.service';
 import { LyricsService } from '../lyrics/lyrics.service';
@@ -18,6 +19,8 @@ describe('AdminService', () => {
     create: jest.fn(),
     update: jest.fn(),
     remove: jest.fn(),
+    findOneIncludingInactive: jest.fn(),
+    restore: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -168,5 +171,28 @@ describe('AdminService', () => {
     await service.deleteLyric(7);
 
     expect(mockLyricsService.remove).toHaveBeenCalledWith(7);
+  });
+
+  it('should restore a soft-deleted lyric using findOneIncludingInactive', async () => {
+    const inactive = { id: 5, isActive: false };
+    const restored = { id: 5, isActive: true };
+    mockLyricsService.findOneIncludingInactive.mockResolvedValue(inactive);
+    mockLyricsService.restore.mockResolvedValue(restored);
+
+    await expect(service.restoreLyric(5)).resolves.toEqual(restored);
+    expect(mockLyricsService.findOneIncludingInactive).toHaveBeenCalledWith(5);
+    expect(mockLyricsService.restore).toHaveBeenCalledWith(5);
+  });
+
+  it('should throw ConflictException when restoring an already active lyric', async () => {
+    mockLyricsService.findOneIncludingInactive.mockResolvedValue({
+      id: 5,
+      isActive: true,
+    });
+
+    await expect(service.restoreLyric(5)).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+    expect(mockLyricsService.restore).not.toHaveBeenCalled();
   });
 });
