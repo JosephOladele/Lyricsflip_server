@@ -38,6 +38,8 @@ export interface OnChainPot {
   fundedA: boolean;
   fundedB: boolean;
   status: PotStatus;
+  /** Ledger after which a player may reclaim their own stake via `claim_refund`. */
+  deadlineLedger: number;
 }
 
 /**
@@ -118,6 +120,41 @@ export class EscrowContractService {
     playerAddress: string,
   ): Promise<UnsignedTransaction> {
     const transaction = await this.buildStake(
+      playerAddress,
+      sessionId,
+      playerAddress,
+    );
+
+    return this.rpc.toUnsigned(transaction);
+  }
+
+  /**
+   * Builds the transaction that lets a player reclaim their own stake once the
+   * pot's `deadline_ledger` has passed.
+   *
+   * Like `stake`, the contract requires the *player's* authorisation, so this
+   * returns a prepared transaction rather than submitting one.
+   */
+  async buildClaimRefund(
+    sourcePublicKey: string,
+    sessionId: string,
+    playerAddress: string,
+  ): Promise<Transaction> {
+    return this.rpc.buildInvocation(
+      sourcePublicKey,
+      this.config.escrowContractId,
+      'claim_refund',
+      [this.sessionIdToScVal(sessionId), addressToScVal(playerAddress)],
+      this.config.stakeTxTimeoutSeconds,
+    );
+  }
+
+  /** Builds a `claim_refund` transaction and serialises it for a wallet to sign. */
+  async buildUnsignedClaimRefund(
+    sessionId: string,
+    playerAddress: string,
+  ): Promise<UnsignedTransaction> {
+    const transaction = await this.buildClaimRefund(
       playerAddress,
       sessionId,
       playerAddress,
@@ -214,6 +251,7 @@ export class EscrowContractService {
         fundedA: Boolean(raw.funded_a),
         fundedB: Boolean(raw.funded_b),
         status: String(raw.status) as PotStatus,
+        deadlineLedger: Number(raw.deadline_ledger ?? 0),
       };
     } catch (error) {
       this.logger.warn(
@@ -275,25 +313,28 @@ export class EscrowContractService {
     }
 
     if (invocation.functionName.toString() !== 'stake') {
-      reject('it calls the wrong contract function');
+      reject('it does not call stake');
     }
 
-    const args = invocation.args;
-    if (args.length !== 2) {
-      reject('it passes the wrong arguments');
+    const [sessionArg, playerArg] = invocation.args;
+    if (!sessionArg || !playerArg) {
+      reject('it is missing arguments');
     }
 
-    const [sessionArg, playerArg] = args;
-    if (sessionArg.switch().name !== 'scvString') {
+    const sessionValue = sessionArg.value();
+    if (sessionValue.switch().name !== 'scvString') {
       reject('the session id is not a string');
     }
-    if (sessionArg.str().toString() !== sessionId) {
-      reject('it stakes a different session');
+    if (sessionValue.str().toString() !== sessionId) {
+      reject('it is for a different session');
     }
 
-    const stakedPlayer = Address.fromScVal(playerArg).toString();
-    if (stakedPlayer !== playerAddress) {
-      reject('it stakes for a different player');
+    const playerValue = playerArg.value();
+    if (playerValue.switch().name !== 'scvAddress') {
+      reject('the player is not an address');
+    }
+    if (Address.fromScVal(playerValue).toString() !== playerAddress) {
+      reject('it is for a different player');
     }
   }
 
@@ -310,15 +351,15 @@ function amountToScVal(amount: Stroops): xdr.ScVal {
   return nativeToScVal(toBigInt(amount), { type: 'i128' });
 }
 
-function decodeBalance(value: unknown): Stroops {
-  if (typeof value === 'bigint') {
-    return value.toString();
+function decodeBalance(balance: unknown): Stroops {
+  if (typeof balance === 'bigint') {
+    return balance.toString();
   }
-  if (typeof value === 'number') {
-    return String(value);
+  if (typeof balance === 'number') {
+    return String(balance);
   }
-  if (typeof value === 'string') {
-    return value;
+  if (typeof balance === 'string') {
+    return balance;
   }
   throw new ServiceUnavailableException('Unexpected token balance response');
 }
