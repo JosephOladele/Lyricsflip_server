@@ -6,6 +6,7 @@ import {
   WebSocketServer,
   OnGatewayConnection,
   OnGatewayDisconnect,
+  WsException,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { Logger, NotFoundException, UsePipes, ValidationPipe } from '@nestjs/common';
@@ -23,7 +24,21 @@ interface GameSession {
   seenLyricIds: Set<number>;
 }
 
-@UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
+@UsePipes(
+  new ValidationPipe({
+    whitelist: true,
+    transform: true,
+    exceptionFactory: (errors) =>
+      new WsException({
+        code: 'VALIDATION_ERROR',
+        message: 'Validation failed',
+        details: errors.map((error) => ({
+          field: error.property,
+          messages: Object.values(error.constraints ?? {}),
+        })),
+      }),
+  }),
+)
 @WebSocketGateway({
   cors: {
     // Same allow-list as the HTTP API (FRONTEND_URL), evaluated per request.

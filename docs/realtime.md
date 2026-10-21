@@ -1,21 +1,29 @@
-# Realtime events
+# Realtime (WebSocket) API
 
-Players get game events pushed over Socket.IO instead of polling. The gateway lives in `src/realtime/`.
+This document describes the WebSocket error contract used by the game and
+realtime gateways.
 
-## Connecting
+## Error contract
 
-- Namespace: `/realtime`
-- Auth: the same JWT as the HTTP API, as `auth: { token }` or an `Authorization: Bearer` header. A missing or invalid token gets an `error` event and a disconnect.
-- On connect the server emits `connected { userId }` and puts the socket in its private `user:<userId>` room.
+All errors emitted over the socket share a single shape:
 
-```ts
-const socket = io('https://api.example.com/realtime', { auth: { token } });
-socket.on('connected', async () => {
-  await socket.emitWithAck('subscribe', { type: 'session', id: sessionId });
-});
-socket.on('round.ended', (e) => console.log(e.userId, e.points));
+```json
+{
+  "event": "error",
+  "data": {
+    "code": 400,
+    "message": "Validation failed",
+    "details": [
+      { "field": "guess", "message": "guess must be a string" }
+    ]
+  }
+}
 ```
 
+- `code` — numeric status code (HTTP-style, e.g. `400`, `403`, `500`).
+- `message` — human-readable summary.
+- `details` — optional array of field-level messages (present for validation
+  failures).
 ## Rooms
 
 | Room            | Joined by                                                   |
@@ -59,10 +67,16 @@ The `/game` namespace runs the same round loop as the HTTP API: every message is
 
 Services raise events on the in-process `EventEmitter2` bus under the names above (`src/realtime/realtime.events.ts`), and `RealtimeGateway` fans them out. Game rounds raise theirs directly. Session, wager and room changes are picked up by a TypeORM subscriber (`EntityEventsSubscriber`), so anything that saves those rows announces them, and events raised inside a transaction are held until it commits.
 
-## Multiple instances
+### Ack callbacks
 
-Set `REDIS_URL`. `main.ts` then installs `RedisIoAdapter` (`@socket.io/redis-adapter`), so an event raised on one instance reaches sockets connected to any other. Without it the in-memory adapter is used, which is right for a single instance.
+When a client sends an event with an acknowledgement callback, the same
+`{ code, message, details }` object is passed to the ack instead of (or in
+addition to) the `error` event, so callers can handle failures inline.
 
-## Not in this contract
+### Validation failures
 
-Round events raised from an instance other than the one a database change happened on rely on the adapter above. The bus itself is per-process: an event is emitted by the instance that handled the request or ran the query.
+Gateway handlers validate payloads with a `ValidationPipe` configured with an
+exception factory that throws `WsException`. An invalid payload (for example an
+invalid `submitGuess` body) therefore returns a `400`-style error with
+field-level messages over the socket rather than a generic
+`Internal server error`.
