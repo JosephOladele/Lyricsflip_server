@@ -68,6 +68,13 @@ export interface RoomGuessResult {
   lyric: RoomLyricView;
 }
 
+/**
+ * Unambiguous uppercase alphabet for room codes.
+ * Excludes 0/O and 1/I to avoid confusion when codes are read aloud or typed.
+ */
+const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const ROOM_CODE_LENGTH = 6;
+const ROOM_CODE_MAX_ATTEMPTS = 5;
 /** A single ranked entry in the final room results. */
 export interface RoomResultEntry {
   rank: number;
@@ -121,6 +128,32 @@ export class RoomsService {
       lyric = foundLyric;
     }
 
+    // Generate a unique 6-character code, retrying on unique violations.
+    let lastError: unknown;
+    for (let attempt = 0; attempt < ROOM_CODE_MAX_ATTEMPTS; attempt++) {
+      const code = this.generateRoomCode();
+
+      const room = this.roomRepository.create({
+        name: createRoomDto.name,
+        code,
+        lyric,
+        lyricId: lyric.id,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours from now
+      } as Room);
+
+      try {
+        return await this.roomRepository.save(room);
+      } catch (error) {
+        if (this.isUniqueViolation(error)) {
+          lastError = error;
+          this.logger.warn(
+            `Room code collision on attempt ${attempt + 1}, retrying`,
+          );
+          continue;
+        }
+        throw error;
+      }
+    }
     // Generate a unique 6-character code
     const code = this.generateRoomCode();
 
@@ -139,10 +172,13 @@ export class RoomsService {
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours from now
     } as Room);
 
-    return this.roomRepository.save(room);
+    this.logger.error('Failed to generate a unique room code', lastError as Error);
+    throw new ConflictException('Could not generate a unique room code');
   }
 
   /**
+   * Generates a 6-character uppercase code from an unambiguous alphabet.
+   * Uses crypto.randomInt for uniform, unbiased selection.
    * Pick a random active lyric without a full-table sort.
    *
    * Uses random ID ranges with a retry: pick a random id in [minId, maxId],
@@ -200,20 +236,22 @@ export class RoomsService {
    * Uses base36 encoding of random bytes for a short, URL-friendly code.
    */
   private generateRoomCode(): string {
-    // 3 bytes = 24 bits = up to ~16M combinations, encoded in base36 gives ~5 chars
-    // We'll use 4 bytes and take first 6 chars to be safe
-    const bytes = crypto.randomBytes(4);
-    // Convert to base36 (0-9, a-z) and ensure 6 characters
-    let code = bytes.toString('base64')
-      .replace(/[+/=]/g, '') // Remove base64 special chars
-      .toLowerCase()
-      .substring(0, 6);
-    
-    // If somehow shorter, pad with random chars
-    while (code.length < 6) {
-      code += Math.floor(Math.random() * 36).toString(36);
+    let code = '';
+    for (let i = 0; i < ROOM_CODE_LENGTH; i++) {
+      code += ROOM_CODE_ALPHABET[
+        crypto.randomInt(0, ROOM_CODE_ALPHABET.length)
+      ];
     }
-    return code.substring(0, 6);
+    return code;
+  }
+
+  /** Detects a Postgres unique-constraint violation (SQLSTATE 23505). */
+  private isUniqueViolation(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+    const err = error as { code?: string; driverError?: { code?: string } };
+    return err.code === '23505' || err.driverError?.code === '23505';
   }
 
   async join(roomId: string, userId: string) {
@@ -242,10 +280,11 @@ export class RoomsService {
 
   /**
    * Join a room using its short 6-character code instead of UUID.
+   * Codes are stored uppercase, so the input is uppercased before lookup.
    */
   async joinByCode(code: string, userId: string) {
     const room = await this.roomRepository.findOne({
-      where: { code: code.toUpperCase() },
+      where: { code: code.trim().toUpperCase() },
       relations: ['roomUsers', 'lyric'],
     });
 
@@ -449,14 +488,88 @@ export class RoomsService {
     userId: string,
     guessDto: GuessLyricDto,
   ): Promise<RoomGuessResult> {
+    const room = await this.roomRepository.findOne({
+      where: { id: roomId },
+      relations: ['lyric'],
+    });
+
+    if (!room) {
+      throw new NotFoundException('Room not found');
+    }
+
+    this.assertPlayable(room);
+
     const roomUser = await this.roomUserRepository.findOne({
       where: { roomId, userId },
-      relations: ['room', 'room.lyric'],
     });
 
     if (!roomUser) {
       throw new NotFoundException('User has not joined this room');
     }
+
+    // Atomically claim the guess. Only one concurrent request can flip
+    // hasGuessed from false to true; the loser sees zero affected rows.
+    const claim = await this.roomUserRepository
+      .createQueryBuilder()
+      .update(RoomUser)
+      .set({ hasGuessed: true, guessedAt: () => 'now()' })
+      .where('id = :id AND "hasGuessed" = false', { id: roomUser.id })
+      .execute();
+
+    if (!claim.affected || claim.affected !== 1) {
+      // Already guessed (or lost the race). Do not reveal the answer.
+      throw new ConflictException('You have already guessed in this room');
+    }
+
+    const lyric = room.lyric;
+    const guessType = guessDto.guessType ?? GuessType.SONG_TITLE;
+    const guess = guessDto.guess;
+
+    const isCorrect = matchGuess(guess, lyric, guessType);
+    const score = isCorrect ? this.calculateScore(lyric, guessType) : 0;
+
+    // Persist the score now that the guess is claimed.
+    await this.roomUserRepository.update(roomUser.id, { score });
+
+    return {
+      roomId: room.id,
+      guessType,
+      guess,
+      isCorrect,
+      score,
+      correctAnswer: `${lyric.artist} - ${lyric.songTitle}`,
+      lyric: this.toLyricView(lyric, true),
+    };
+  }
+
+  private calculateScore(lyric: Lyrics, guessType: GuessType): number {
+    // Base score per guess type; kept simple and deterministic.
+    return guessType === GuessType.SONG_TITLE ? 100 : 50;
+  }
+
+  private toLyricView(lyric: Lyrics, reveal: boolean): RoomLyricView {
+    const view: RoomLyricView = {
+      id: lyric.id,
+      lyricSnippet: lyric.lyricSnippet,
+      category: lyric.category,
+      genre: lyric.genre,
+      decade: lyric.decade,
+    };
+    if (reveal) {
+      view.artist = lyric.artist;
+      view.songTitle = lyric.songTitle;
+    }
+    return view;
+  }
+
+  private toPlayerView(roomUser: RoomUser): RoomPlayerView {
+    return {
+      id: roomUser.userId,
+      username: roomUser.user?.username ?? null,
+      hasGuessed: roomUser.hasGuessed,
+      score: roomUser.score,
+    };
+  }
 
     if (roomUser.hasGuessed) {
       throw new ConflictException('User has already guessed in this room');
@@ -520,6 +633,19 @@ export class RoomsService {
     }
   }
 
+  @Cron(CronExpression.EVERY_HOUR)
+  async closeExpiredRooms(): Promise<void> {
+    const acquired = await this.jobLock.acquire('rooms:close-expired', 60_000);
+    if (!acquired) {
+      return;
+    }
+    try {
+      await this.roomRepository.update(
+        { isClosed: false, expiresAt: LessThanOrEqual(new Date()) },
+        { isClosed: true },
+      );
+    } finally {
+      await this.jobLock.release('rooms:close-expired');
   /**
    * Close expired rooms on a schedule.
    */
