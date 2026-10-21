@@ -994,3 +994,6 @@ Do not run stellar mode with real value until the P0 issues are closed.
 
 <!-- handsoff-issue-299 -->
 - #299: [R2-44] Invitation expiry races with accept, and abandons a session before its refund succeeds
+
+<!-- handsoff-issue-336 -->
+- #336: [R2-81] Friends and direct challenges (first-round #94, never implemented)
