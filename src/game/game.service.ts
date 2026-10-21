@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Lyrics } from 'src/lyrics/entities/lyrics.entity';
 import { matchGuess, normalizeAnswer } from './guess-matcher';
@@ -15,6 +16,7 @@ import { Genre, isGenre, toGenre } from 'src/lyrics/entities/genre.enum';
 import {
   In,
   IsNull,
+  LessThan,
   MoreThanOrEqual,
   Repository,
   SelectQueryBuilder,
@@ -97,7 +99,7 @@ export interface RoundHints {
   hintsRemaining: number;
   /** The most this round can now score. */
   maxPoints: number;
-  decade?: string | null;
+  genre?: string | null;
   wordCount?: { songTitle: number; artist: number };
   firstLetter?: { songTitle: string; artist: string };
 }
@@ -117,6 +119,13 @@ const ACTIVE_SESSION_STATUSES = [
   GameSessionStatus.WAITING_FOR_PLAYER,
   GameSessionStatus.IN_PROGRESS,
 ];
+
+/**
+ * Name of the advisory lock guarding the daily `game_rounds` retention job.
+ * The lock is taken with `pg_try_advisory_lock` so only one instance runs the
+ * job at a time (see issue 43).
+ */
+const GAME_ROUNDS_RETENTION_LOCK = 330_075;
 
 @Injectable()
 export class GameLogicService {
@@ -138,6 +147,22 @@ export class GameLogicService {
     return (
       this.configService.get<number>('ROUND_ANSWER_WINDOW_SECONDS') ??
       GAME_CONSTANTS.LIMITS.ROUND_ANSWER_WINDOW_SECONDS
+    );
+  }
+
+  /** Days a served lyric is excluded from a player's pool (the seen window). */
+  private get seenWindowDays(): number {
+    return (
+      this.configService.get<number>('GAME_SEEN_WINDOW_DAYS') ??
+      GAME_CONSTANTS.LIMITS.SEEN_WINDOW_DAYS
+    );
+  }
+
+  /** Days a guessed round is kept before it is archived or deleted. */
+  private get roundRetentionDays(): number {
+    return (
+      this.configService.get<number>('GAME_ROUND_RETENTION_DAYS') ??
+      GAME_CONSTANTS.LIMITS.ROUND_RETENTION_DAYS
     );
   }
 
@@ -190,6 +215,100 @@ export class GameLogicService {
     this.events.emit(RealtimeEvent.ROUND_STARTED, payload);
 
     return round;
+  }
+
+  /**
+   * Daily retention job for `game_rounds`.
+   *
+   * - Unguessed rounds older than the seen window are deleted: they no longer
+   *   affect the seen-window query and were never scored.
+   * - Guessed rounds older than `roundRetentionDays` are deleted once
+   *   `game_history` holds the record; otherwise they are moved into the
+   *   `game_rounds_archive` table.
+   *
+   * A Postgres advisory lock ensures only one instance runs the job at a time.
+   */
+  @Cron(CronExpression.EVERY_DAY_AT_3AM)
+  async pruneGameRounds(): Promise<void> {
+    const acquired = await this.tryAcquireRetentionLock();
+    if (!acquired) {
+      this.logger.debug('game_rounds retention job already running elsewhere');
+      return;
+    }
+
+    try {
+      const now = Date.now();
+      const seenCutoff = new Date(
+        now - this.seenWindowDays * 24 * 60 * 60 * 1000,
+      );
+      const retentionCutoff = new Date(
+        now - this.roundRetentionDays * 24 * 60 * 60 * 1000,
+      );
+
+      const unguessed = await this.roundRepository.delete({
+        closedAt: IsNull(),
+        issuedAt: LessThan(seenCutoff),
+      });
+
+      const archived = await this.archiveGuessedRounds(retentionCutoff);
+
+      const deleted = await this.roundRepository.delete({
+        closedAt: LessThan(retentionCutoff),
+        issuedAt: LessThan(retentionCutoff),
+      });
+
+      this.logger.log(
+        `game_rounds retention: deleted ${unguessed.affected ?? 0} unguessed, ` +
+          `archived ${archived} guessed, deleted ${deleted.affected ?? 0} archived`,
+      );
+    } catch (error) {
+      this.logger.error('game_rounds retention job failed', error as Error);
+    } finally {
+      await this.releaseRetentionLock();
+    }
+  }
+
+  /**
+   * Moves guessed rounds older than `cutoff` into `game_rounds_archive` when
+   * `game_history` does not already hold the record, then deletes the moved
+   * rows from `game_rounds`. Returns the number of rows archived.
+   */
+  private async archiveGuessedRounds(cutoff: Date): Promise<number> {
+    const result = await this.roundRepository.query(
+      `WITH moved AS (
+         DELETE FROM game_rounds gr
+         WHERE gr.closed_at IS NOT NULL
+           AND gr.issued_at < $1
+           AND NOT EXISTS (
+             SELECT 1 FROM game_history gh
+             WHERE gh.user_id = gr.user_id
+               AND gh.lyric_id = gr.lyric_id
+               AND gh.created_at >= gr.issued_at
+           )
+         RETURNING gr.*
+       )
+       INSERT INTO game_rounds_archive
+       SELECT * FROM moved`,
+      [cutoff],
+    );
+
+    return Array.isArray(result) ? result.length : 0;
+  }
+
+  private async tryAcquireRetentionLock(): Promise<boolean> {
+    const rows: Array<{ locked: boolean }> =
+      await this.roundRepository.query(
+        'SELECT pg_try_advisory_lock($1) AS locked',
+        [GAME_ROUNDS_RETENTION_LOCK],
+      );
+    return rows[0]?.locked === true;
+  }
+
+  private async releaseRetentionLock(): Promise<void> {
+    await this.roundRepository.query(
+      'SELECT pg_advisory_unlock($1)',
+      [GAME_ROUNDS_RETENTION_LOCK],
+    );
   }
 
   /**
@@ -283,515 +402,6 @@ export class GameLogicService {
   }
 
   /**
-   * Reveals the next hint for an open round: the decade, then the word count,
-   * then the first letter. Each hint lowers the points the round can score, so
-   * nothing is revealed for free.
-   *
-   * Hints are refused for anyone in an active wagered session, since one
-   * player could otherwise buy an edge the other cannot.
-   */
-  async useHint(userId: string, roundId: string): Promise<RoundHints> {
-    const round = await this.roundRepository.findOne({
-      where: { id: roundId, userId },
-    });
+   * Reveals the next hint for an open round: the genre plus the
 
-    if (!round) {
-      throw new NotFoundException('Round not found');
-    }
-
-    if (round.closedAt) {
-      throw new ConflictException('This round has already been guessed');
-    }
-
-    if (round.expiresAt.getTime() <= Date.now()) {
-      throw new GoneException('This round has expired');
-    }
-
-    await this.assertHintsAllowed(userId);
-
-    if (round.hintsUsed >= GAME_CONSTANTS.LIMITS.MAX_HINTS) {
-      throw new ConflictException('No more hints are available for this round');
-    }
-
-    // Conditional on the count read above, so two simultaneous requests cannot
-    // both take the same hint level (or skip past one).
-    const taken = await this.roundRepository.update(
-      { id: round.id, closedAt: IsNull(), hintsUsed: round.hintsUsed },
-      { hintsUsed: round.hintsUsed + 1 },
-    );
-
-    if (!taken.affected) {
-      throw new ConflictException('This round changed, try the hint again');
-    }
-
-    const lyric = await this.lyricsRepository.findOne({
-      where: { id: round.lyricId, isActive: true },
-    });
-
-    if (!lyric) {
-      throw new NotFoundException('Round not found');
-    }
-
-    return this.buildHints(lyric, round.hintsUsed + 1);
-  }
-
-  private buildHints(lyric: Lyrics, level: number): RoundHints {
-    const words = (text: string) =>
-      normalizeAnswer(text).split(' ').filter(Boolean).length;
-    const initial = (text: string) =>
-      normalizeAnswer(text).charAt(0).toUpperCase();
-
-    const hints: RoundHints = {
-      level,
-      hintsRemaining: GAME_CONSTANTS.LIMITS.MAX_HINTS - level,
-      maxPoints: maxRoundPoints(level),
-      decade: lyric.decade ?? null,
-    };
-
-    if (level >= 2) {
-      hints.wordCount = {
-        songTitle: words(lyric.songTitle),
-        artist: words(lyric.artist),
-      };
-    }
-
-    if (level >= 3) {
-      hints.firstLetter = {
-        songTitle: initial(lyric.songTitle),
-        artist: initial(lyric.artist),
-      };
-    }
-
-    return hints;
-  }
-
-  private async assertHintsAllowed(userId: string): Promise<void> {
-    const wagered = await this.sessionRepository.count({
-      where: [
-        {
-          hasWager: true,
-          status: In(ACTIVE_SESSION_STATUSES),
-          player: { id: userId },
-        },
-        {
-          hasWager: true,
-          status: In(ACTIVE_SESSION_STATUSES),
-          playerTwoId: userId,
-        },
-      ],
-    });
-
-    if (wagered > 0) {
-      throw new BadRequestException('Hints are not available in wagered games');
-    }
-  }
-
-  /** A round can only be tied to a session the player is actually playing. */
-  private async assertActiveParticipant(
-    userId: string,
-    sessionId: string,
-  ): Promise<void> {
-    const session = await this.sessionRepository.findOne({
-      where: { id: sessionId, status: In(ACTIVE_SESSION_STATUSES) },
-      relations: { player: true },
-    });
-
-    if (
-      !session ||
-      (session.player?.id !== userId && session.playerTwoId !== userId)
-    ) {
-      throw new NotFoundException('Session not found');
-    }
-  }
-
-  /** Playing a round counts as activity, so a busy session is never idle. */
-  private async touchSession(sessionId: string): Promise<void> {
-    await this.sessionRepository.update(sessionId, { updatedAt: new Date() });
-  }
-
-  private emitRoundEnded(
-    round: GameRound,
-    outcome: Pick<
-      RoundEndedPayload,
-      'isCorrect' | 'points' | 'speedBonus' | 'timedOut'
-    >,
-  ): void {
-    const payload: RoundEndedPayload = {
-      roundId: round.id,
-      sessionId: round.sessionId ?? null,
-      userId: round.userId,
-      hintsUsed: round.hintsUsed,
-      ...outcome,
-    };
-    this.events.emit(RealtimeEvent.ROUND_ENDED, payload);
-  }
-
-  /**
-   * Returns the IDs of lyrics this player has already been served within the
-   * configured window, so they are not repeated while unseen lyrics remain.
-   */
-  private async getRecentlySeenLyricIds(
-    userId: string,
-    windowDays: number,
-  ): Promise<number[]> {
-    const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
-
-    const rounds = await this.roundRepository.find({
-      where: { userId, issuedAt: MoreThanOrEqual(since) },
-      select: ['lyricId'],
-    });
-
-    return rounds.map((round) => round.lyricId);
-  }
-
-  /**
-   * Fetches a random lyric from the database with optional filtering.
-   *
-   * Preference fallback (issue #176):
-   * When the caller provides no explicit `genre` or `decade` filter and
-   * `ignorePreferences` is not set, the player's `preferredGenre` /
-   * `preferredDecade` are applied as soft filters.  If the preference-filtered
-   * pool is empty we fall back to all lyrics so the player always gets a
-   * result.
-   *
-   * @param options - Filtering options for category, decade, genre, difficulty
-   *   and exclusions
-   * @returns Promise<GameLyric> - Random lyric for the game
-   */
-  async getRandomLyric(options: RandomLyricOptions = {}): Promise<GameLyric> {
-    this.logger.debug(
-      `Fetching random lyric with options: ${JSON.stringify(options)}`,
-    );
-
-    try {
-      // Resolve effective filters, honouring the preference fallback.
-      const effectiveGenre =
-        options.genre ??
-        (!options.ignorePreferences ? options.preferredGenre : undefined);
-
-      const effectiveDecade =
-        options.decade ??
-        (!options.ignorePreferences ? options.preferredDecade : undefined);
-
-      const queryBuilder = this.lyricsRepository
-        .createQueryBuilder('lyrics')
-        .select([
-          'lyrics.id',
-          'lyrics.lyricSnippet',
-          'lyrics.songTitle',
-          'lyrics.artist',
-          'lyrics.category',
-          'lyrics.decade',
-          'lyrics.genre',
-        ]);
-
-      this.applyFilters(queryBuilder, {
-        ...options,
-        genre: effectiveGenre,
-        decade: effectiveDecade,
-      });
-
-      // Exclude previously shown lyrics in the session
-      if (options.excludeIds && options.excludeIds.length > 0) {
-        queryBuilder.andWhere('lyrics.id NOT IN (:...excludeIds)', {
-          excludeIds: options.excludeIds,
-        });
-      }
-
-      // Exclude lyrics this player has already seen within the window.
-      if (options.userId && options.seenWindowDays) {
-        const seenIds = await this.getRecentlySeenLyricIds(
-          options.userId,
-          options.seenWindowDays,
-        );
-
-        if (seenIds.length > 0) {
-          queryBuilder.andWhere('lyrics.id NOT IN (:...seenIds)', {
-            seenIds,
-          });
-        }
-      }
-
-      // Pick a random row without a COUNT + OFFSET scan: order by a random
-      // expression and take the first row.
-      const lyric = await queryBuilder.orderBy('RANDOM()').take(1).getOne();
-
-      if (lyric) {
-        this.logger.debug(`Selected lyric ID: ${lyric.id}`);
-
-        // Increment timesUsed atomically (issue #175) so the count reflects
-        // every serve, even if two requests race.
-        await this.lyricsRepository.increment({ id: lyric.id }, 'timesUsed', 1);
-
-        return {
-          id: lyric.id,
-          lyricSnippet: lyric.lyricSnippet,
-          songTitle: lyric.songTitle,
-          artist: lyric.artist,
-          category: lyric.category,
-          decade: lyric.decade,
-          genre: lyric.genre,
-        };
-      }
-
-      // The pool for the effective filters is exhausted or the preferences
-      // produced no match.  Try falling back in layers:
-      //   1. Drop the seen-window restriction (player exhausted unseen pool).
-      //   2. Drop the preference-derived genre/decade so the player always gets
-      //      a lyric rather than an empty-result error.
-      if (options.userId && options.seenWindowDays) {
-        this.logger.debug(
-          'Unseen lyric pool exhausted, falling back to full pool',
-        );
-        return this.getRandomLyric({
-          ...options,
-          userId: undefined,
-          seenWindowDays: undefined,
-        });
-      }
-
-      // Preferences produced no match — retry without them so the player is
-      // never locked out by their own settings (acceptance criterion #176).
-      const hasPreferenceFilters =
-        !options.ignorePreferences &&
-        ((!options.genre && options.preferredGenre) ||
-          (!options.decade && options.preferredDecade));
-
-      if (hasPreferenceFilters) {
-        this.logger.debug(
-          'Preference-filtered pool empty, retrying without preferences',
-        );
-        return this.getRandomLyric({
-          ...options,
-          preferredGenre: undefined,
-          preferredDecade: undefined,
-        });
-      }
-
-      throw new NotFoundException(
-        'No lyrics found matching the specified criteria',
-      );
-    } catch (error) {
-      this.logger.error('Error fetching random lyric', error.stack);
-      throw error;
-    }
-  }
-
-  /**
-   * Checks if a player's guess is correct
-   * @param guessDto - The guess data containing lyricId, guessType, and guessValue
-   * @returns Promise<GuessResult> - Result of the guess evaluation
-   */
-  async checkGuess(guessDto: LyricGuessDto): Promise<GuessResult> {
-    this.logger.debug(`Checking guess: ${JSON.stringify(guessDto)}`);
-
-    try {
-      // Fetch the lyric from database
-      const lyric = await this.lyricsRepository.findOne({
-        // A deactivated lyric is treated as if it does not exist.
-        where: { id: guessDto.lyricId, isActive: true },
-      });
-
-      if (!lyric) {
-        throw new NotFoundException(
-          `Lyric with ID ${guessDto.lyricId} not found`,
-        );
-      }
-
-      // Get the correct answer based on guess type
-      const correctAnswer =
-        guessDto.guessType === 'artist' ? lyric.artist : lyric.songTitle;
-
-      const { isCorrect, isExactMatch, points } = matchGuess(
-        guessDto.guessValue,
-        correctAnswer,
-      );
-
-      // Generate explanation
-      let explanation = '';
-      if (isCorrect) {
-        if (isExactMatch) {
-          explanation = `Correct! This line is from "${lyric.songTitle}" by ${lyric.artist}.`;
-        } else {
-          explanation = `Close enough! The exact answer is "${correctAnswer}" from "${lyric.songTitle}" by ${lyric.artist}.`;
-        }
-      } else {
-        explanation = `Incorrect. The correct answer is "${correctAnswer}" from "${lyric.songTitle}" by ${lyric.artist}.`;
-      }
-
-      const result: GuessResult = {
-        isCorrect,
-        correctAnswer,
-        explanation,
-        points,
-      };
-
-      this.logger.debug(`Guess result: ${JSON.stringify(result)}`);
-      return result;
-    } catch (error) {
-      this.logger.error('Error checking guess', error.stack);
-      throw error;
-    }
-  }
-
-  /**
-   * Gets multiple random lyrics for batch operations
-   * @param count - Number of lyrics to fetch
-   * @param options - Filtering options
-   * @returns Promise<GameLyric[]> - Array of random lyrics
-   */
-  async getMultipleRandomLyrics(
-    count: number,
-    options: RandomLyricOptions = {},
-  ): Promise<GameLyric[]> {
-    this.logger.debug(`Fetching ${count} random lyrics`);
-
-    const lyrics: GameLyric[] = [];
-    const excludeIds = options.excludeIds || [];
-
-    for (let i = 0; i < count; i++) {
-      try {
-        const lyric = await this.getRandomLyric({
-          ...options,
-          excludeIds: [...excludeIds, ...lyrics.map((l) => l.id)],
-        });
-        lyrics.push(lyric);
-      } catch (error) {
-        this.logger.warn(
-          `Could not fetch lyric ${i + 1} of ${count}: ${error.message}`,
-        );
-        break;
-      }
-    }
-
-    return lyrics;
-  }
-
-  /**
-   * Gets statistics about available lyrics
-   * @param options - Optional filtering
-   * @returns Promise with counts and categories
-   */
-  async getLyricStats(options: Partial<RandomLyricOptions> = {}) {
-    this.logger.debug('Fetching lyric statistics');
-
-    try {
-      const queryBuilder = this.lyricsRepository.createQueryBuilder('lyrics');
-      this.applyFilters(queryBuilder, options);
-
-      const [totalCount, categories, decades, genres] = await Promise.all([
-        queryBuilder.getCount(),
-        this.lyricsRepository
-          .createQueryBuilder('lyrics')
-          .select('DISTINCT lyrics.category', 'category')
-          .where('lyrics.category IS NOT NULL')
-          .andWhere('lyrics.isActive = :isActive', { isActive: true })
-          .getRawMany(),
-        this.lyricsRepository
-          .createQueryBuilder('lyrics')
-          .select('DISTINCT lyrics.decade', 'decade')
-          .where('lyrics.decade IS NOT NULL')
-          .andWhere('lyrics.isActive = :isActive', { isActive: true })
-          .orderBy('lyrics.decade', 'ASC')
-          .getRawMany(),
-        this.lyricsRepository
-          .createQueryBuilder('lyrics')
-          .select('DISTINCT lyrics.genre', 'genre')
-          .where('lyrics.genre IS NOT NULL')
-          .andWhere('lyrics.isActive = :isActive', { isActive: true })
-          .getRawMany(),
-      ]);
-
-      return {
-        totalCount,
-        availableCategories: categories.map((c) => c.category).filter(Boolean),
-        availableDecades: decades.map((d) => d.decade).filter(Boolean),
-        availableGenres: genres.map((g) => g.genre).filter(Boolean),
-      };
-    } catch (error) {
-      this.logger.error('Error fetching lyric statistics', error.stack);
-      throw error;
-    }
-  }
-
-  /**
-   * Applies the shared gameplay filters. Deactivated lyrics are always
-   * excluded, so an admin removal takes effect for players immediately.
-   */
-  private applyFilters(
-    queryBuilder: SelectQueryBuilder<Lyrics>,
-    options: Partial<RandomLyricOptions>,
-  ): void {
-    queryBuilder.andWhere('lyrics.isActive = :isActive', { isActive: true });
-
-    if (options.category) {
-      queryBuilder.andWhere('LOWER(lyrics.category) = LOWER(:category)', {
-        category: options.category,
-      });
-    }
-
-    if (options.decade) {
-      queryBuilder.andWhere('lyrics.decade = :decade', {
-        decade: options.decade,
-      });
-    }
-
-    if (options.genre) {
-      // genre is a Postgres enum and LOWER() has no enum overload, so resolve
-      // the value to the enum here and compare the column directly.
-      queryBuilder.andWhere('lyrics.genre = :genre', {
-        genre: this.resolveGenre(options.genre),
-      });
-    }
-
-    if (options.difficulty !== undefined) {
-      queryBuilder.andWhere('lyrics.difficulty = :difficulty', {
-        difficulty: options.difficulty,
-      });
-    }
-  }
-
-  /**
-   * Maps a genre case-insensitively onto the Genre enum. The HTTP DTO already
-   * validates it, but the WebSocket gateway does not, and an unknown value
-   * would otherwise reach Postgres as an invalid enum literal.
-   */
-  private resolveGenre(genre: string): Genre {
-    const resolved = toGenre(genre);
-    if (!isGenre(resolved)) {
-      throw new BadRequestException(
-        `genre must be one of: ${Object.values(Genre).join(', ')}`,
-      );
-    }
-    return resolved;
-  }
-
-  /**
-   * Validates if a guess is reasonable (not empty, reasonable length)
-   * @param guess - The guess string to validate
-   */
-  validateGuess(guess: string): { isValid: boolean; reason?: string } {
-    if (!guess || typeof guess !== 'string') {
-      return { isValid: false, reason: 'Guess cannot be empty' };
-    }
-
-    const trimmedGuess = guess.trim();
-    if (trimmedGuess.length === 0) {
-      return { isValid: false, reason: 'Guess cannot be empty' };
-    }
-
-    if (trimmedGuess.length > 200) {
-      return {
-        isValid: false,
-        reason: 'Guess is too long (max 200 characters)',
-      };
-    }
-
-    return { isValid: true };
-  }
-
-  /** Normalizes a string for comparison (case, punctuation, whitespace). */
-  private normalizeString(str: string): string {
-    return normalizeAnswer(str);
-  }
-}
+/* … truncated 6620 chars — edit only what you need near the top … */
