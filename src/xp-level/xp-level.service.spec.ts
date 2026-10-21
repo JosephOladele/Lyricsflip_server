@@ -129,4 +129,46 @@ describe('XpLevelService', () => {
       expect(result.levelTitle).toBe(UserLevel.GOSSIP_GURU);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // handleCorrectGuess — atomic XP awards under concurrency
+  // -------------------------------------------------------------------------
+  describe('handleCorrectGuess (concurrency)', () => {
+    it('never loses writes: 20 parallel awards of 10 XP give exactly +200', async () => {
+      // In-memory store simulating the users table. The atomic UPDATE is
+      // modelled as a synchronous read-modify-write so that, even when many
+      // awards are fired in parallel, each increment is applied exactly once.
+      let storedXp = 0;
+      let storedLevel = 1;
+
+      const repo = {
+        query: jest.fn(async (sql: string, params: any[]) => {
+          if (/UPDATE\s+users\s+SET\s+xp\s*=\s*xp\s*\+/.test(sql)) {
+            const amount = Number(params[0]);
+            storedXp += amount;
+            return [{ xp: storedXp, level: storedLevel }];
+          }
+          if (/UPDATE\s+users\s+SET\s+level/.test(sql)) {
+            const newLevel = Number(params[0]);
+            const newTitle = params[1];
+            if (storedLevel < newLevel) {
+              storedLevel = newLevel;
+            }
+            return [{ level: storedLevel, levelTitle: newTitle }];
+          }
+          return [];
+        }),
+      } as unknown as jest.Mocked<Repository<any>>;
+
+      const concurrentService = new XpLevelService(repo);
+
+      await Promise.all(
+        Array.from({ length: 20 }, () =>
+          concurrentService.handleCorrectGuess('user-1', 1),
+        ),
+      );
+
+      expect(storedXp).toBe(200);
+    });
+  });
 });

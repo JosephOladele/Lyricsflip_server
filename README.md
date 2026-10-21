@@ -52,6 +52,7 @@ This repository is the backend. It is a [NestJS](https://nestjs.com) 11 applicat
 - [Current limitations](#current-limitations)
 - [Contributing](#contributing)
 - [Further documentation](#further-documentation)
+- [Changelog](CHANGELOG.md)
 
 ---
 
@@ -982,6 +983,7 @@ Do not run stellar mode with real value until the P0 issues are closed.
 - [`docs/DATA_ARCHIVING.md`](docs/DATA_ARCHIVING.md): archiving old data
 - [`src/notifications/README.md`](src/notifications/README.md): notification events and payloads
 - [`.env.example`](.env.example): every environment variable, with the Stellar ones annotated
+- [`CHANGELOG.md`](CHANGELOG.md): release history and notable changes
 
 ## Handsoff notes
 

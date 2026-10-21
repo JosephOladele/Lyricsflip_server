@@ -236,10 +236,9 @@ POST /lyrics/cache/clear
 
 ## Future Enhancements
 
-### 1. Redis Integration
-- Replace in-memory cache with Redis
-- Enable distributed caching
-- Support for cache persistence
+### 1. Redis Cluster & Sentinel
+- Support Redis Cluster topologies for large horizontal deployments
+- High-availability Redis Sentinel automated failover
 
 ### 2. Advanced Caching Strategies
 - Cache warming for popular queries

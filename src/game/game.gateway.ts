@@ -8,7 +8,7 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { Logger, UsePipes, ValidationPipe } from '@nestjs/common';
+import { Logger, NotFoundException, UsePipes, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { GameLogicService } from './game.service';
@@ -17,10 +17,9 @@ import { GuessDto } from './dto/guess.dto';
 
 interface GameSession {
   playerId: string;
-  score: number;
-  streak: number;
-  currentLyric?: any;
-  /** Lyric IDs already served to this player, to avoid repeats. */
+  /** Round currently open for this socket, if any. */
+  currentRoundId?: string;
+  /** Lyric IDs already served to this socket, to avoid repeats. */
   seenLyricIds: Set<number>;
 }
 
@@ -44,6 +43,8 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   server: Server;
 
   private readonly logger = new Logger(GameGateway.name);
+  // Socket-local state keyed by client.id so two tabs of the same user play
+  // independently. Authoritative round/score state lives in the database.
   private sessions = new Map<string, GameSession>();
 
   constructor(
@@ -83,24 +84,21 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client.data.userId = userId;
     this.logger.log(`Client connected: ${client.id} (user ${userId})`);
 
-    // Initialize session, keyed by user ID (replaces any stale one)
-    this.sessions.set(userId, {
+    // Initialize per-socket session, keyed by client.id.
+    this.sessions.set(client.id, {
       playerId: userId,
-      score: 0,
-      streak: 0,
       seenLyricIds: new Set<number>(),
     });
 
     client.emit('connected', {
       message: 'Connected to LyricFlip game!',
-      sessionId: userId,
+      sessionId: client.id,
     });
   }
 
   handleDisconnect(client: Socket) {
     this.logger.log(`Client disconnected: ${client.id}`);
-    const userId = client.data?.userId;
-    if (userId) this.sessions.delete(userId);
+    this.sessions.delete(client.id);
   }
 
   @SubscribeMessage('requestLyric')
@@ -111,49 +109,54 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.logger.log(`Lyric requested by ${client.id}`);
 
     try {
-      const session = this.sessions.get(client.data.userId);
+      const session = this.sessions.get(client.id);
       if (!session) {
         client.emit('error', { message: 'Session not found' });
         return;
       }
 
-      // Exclude lyrics this player has already seen so they don't repeat.
+      // Exclude lyrics this socket has already seen so they don't repeat.
       const excludeIds = Array.from(session.seenLyricIds);
-      if (session.currentLyric) excludeIds.push(session.currentLyric.id);
 
-      let lyric = await this.gameLogicService.getRandomLyric({
-        ...options,
-        excludeIds,
-      });
-
-      // Fall back gracefully when the unseen pool is exhausted: reset the
-      // seen set and retry so the player can keep playing.
-      if (!lyric && excludeIds.length > 0) {
-        session.seenLyricIds.clear();
-        lyric = await this.gameLogicService.getRandomLyric({
-          ...options,
-          excludeIds: session.currentLyric ? [session.currentLyric.id] : [],
-        });
+      let round;
+      try {
+        round = await this.gameLogicService.issueRound(
+          session.playerId,
+          { ...options, excludeIds },
+        );
+      } catch (error) {
+        // The unseen pool is exhausted: reset the seen set and retry so the
+        // player can keep playing.
+        if (error instanceof NotFoundException && excludeIds.length > 0) {
+          session.seenLyricIds.clear();
+          round = await this.gameLogicService.issueRound(
+            session.playerId,
+            { ...options, excludeIds: [] },
+          );
+        } else {
+          throw error;
+        }
       }
 
-      if (!lyric) {
+      session.currentRoundId = round.roundId;
+      session.seenLyricIds.add(round.lyric.id);
+
+      // Send only the lyric snippet (hide answers) plus round timing info.
+      client.emit('newLyric', {
+        roundId: round.roundId,
+        issuedAt: round.issuedAt,
+        answerWindowSeconds: round.answerWindowSeconds,
+        id: round.lyric.id,
+        lyricSnippet: round.lyric.lyricSnippet,
+        category: round.lyric.category,
+        decade: round.lyric.decade,
+        genre: round.lyric.genre,
+      });
+    } catch (error) {
+      if (error instanceof NotFoundException) {
         client.emit('error', { message: 'No lyrics available' });
         return;
       }
-
-      // Store current lyric in session and remember it as seen
-      session.currentLyric = lyric;
-      session.seenLyricIds.add(lyric.id);
-
-      // Send only the lyric snippet (hide answers)
-      client.emit('newLyric', {
-        id: lyric.id,
-        lyricSnippet: lyric.lyricSnippet,
-        category: lyric.category,
-        decade: lyric.decade,
-        genre: lyric.genre,
-      });
-    } catch (error) {
       this.logger.error('Error handling lyric request', error.stack);
       client.emit('error', { message: 'Failed to fetch lyric' });
     }
@@ -167,7 +170,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.logger.log(`Guess submitted by ${client.id}`);
 
     try {
-      const session = this.sessions.get(client.data.userId);
+      const session = this.sessions.get(client.id);
       if (!session) {
         client.emit('error', { message: 'Session not found' });
         return;
@@ -182,52 +185,68 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
         return;
       }
 
-      // Guess against the lyric this socket was served, once, rather than a
+      // Guess against the round this socket was issued, once, rather than a
       // client-supplied ID that could be replayed after the answer is shown.
-      const lyric = session.currentLyric;
-      if (!lyric) {
+      const roundId = session.currentRoundId;
+      if (!roundId) {
         client.emit('error', { message: 'Request a lyric before guessing' });
         return;
       }
-      session.currentLyric = undefined;
+      session.currentRoundId = undefined;
 
-      const result = await this.gameLogicService.checkGuess({
-        lyricId: lyric.id,
-        guessType: guessDto.guessType,
-        guessValue: guessDto.guessValue,
-      });
-
-      // Update session stats
-      if (result.isCorrect) {
-        session.score += result.points ?? 0;
-        session.streak += 1;
-      } else {
-        session.streak = 0;
-      }
-
-      // Send result with updated session info
-      client.emit('guessResult', {
-        ...result,
-        session: {
-          score: session.score,
-          streak: session.streak,
+      const result = await this.gameLogicService.guessRound(
+        session.playerId,
+        roundId,
+        {
+          guessType: guessDto.guessType,
+          guessValue: guessDto.guessValue,
         },
-      });
+      );
+
+      client.emit('guessResult', result);
     } catch (error) {
       this.logger.error('Error handling guess submission', error.stack);
       client.emit('error', { message: 'Failed to process guess' });
     }
   }
 
+  @SubscribeMessage('requestHint')
+  async handleRequestHint(@ConnectedSocket() client: Socket) {
+    this.logger.log(`Hint requested by ${client.id}`);
+
+    try {
+      const session = this.sessions.get(client.id);
+      if (!session) {
+        client.emit('error', { message: 'Session not found' });
+        return;
+      }
+
+      const roundId = session.currentRoundId;
+      if (!roundId) {
+        client.emit('error', { message: 'Request a lyric before a hint' });
+        return;
+      }
+
+      const hint = await this.gameLogicService.useHint(
+        session.playerId,
+        roundId,
+      );
+
+      client.emit('hintResult', hint);
+    } catch (error) {
+      this.logger.error('Error handling hint request', error.stack);
+      client.emit('error', { message: 'Failed to fetch hint' });
+    }
+  }
+
   @SubscribeMessage('getSession')
   handleGetSession(@ConnectedSocket() client: Socket) {
-    const session = this.sessions.get(client.data.userId);
+    const session = this.sessions.get(client.id);
 
     if (session) {
       client.emit('sessionInfo', {
-        score: session.score,
-        streak: session.streak,
         playerId: session.playerId,
+        currentRoundId: session.currentRoundId,
       });
     } else {
       client.emit('error', { message: 'Session not found' });
