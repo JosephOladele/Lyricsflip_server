@@ -1,21 +1,29 @@
-# Realtime events
+# Realtime (WebSocket) API
 
-Players get game events pushed over Socket.IO instead of polling. The gateway lives in `src/realtime/`.
+This document describes the WebSocket error contract used by the game and
+realtime gateways.
 
-## Connecting
+## Error contract
 
-- Namespace: `/realtime`
-- Auth: the same JWT as the HTTP API, as `auth: { token }` or an `Authorization: Bearer` header. A missing or invalid token gets an `error` event and a disconnect.
-- On connect the server emits `connected { userId }` and puts the socket in its private `user:<userId>` room.
+All errors emitted over the socket share a single shape:
 
-```ts
-const socket = io('https://api.example.com/realtime', { auth: { token } });
-socket.on('connected', async () => {
-  await socket.emitWithAck('subscribe', { type: 'session', id: sessionId });
-});
-socket.on('round.ended', (e) => console.log(e.userId, e.points));
+```json
+{
+  "event": "error",
+  "data": {
+    "code": 400,
+    "message": "Validation failed",
+    "details": [
+      { "field": "guess", "message": "guess must be a string" }
+    ]
+  }
+}
 ```
 
+- `code` — numeric status code (HTTP-style, e.g. `400`, `403`, `500`).
+- `message` — human-readable summary.
+- `details` — optional array of field-level messages (present for validation
+  failures).
 ## Rooms
 
 | Room            | Joined by                                                   |
@@ -43,14 +51,32 @@ Every payload also carries `at`, the ISO time the server sent it. No payload con
 
 `round.ended` is also sent when a round expires unanswered (`timedOut: true`, `points: 0`).
 
+## `/game` gateway messages (client → server)
+
+The `/game` namespace runs the same round loop as the HTTP API: every message is backed by `GameLogicService`, so a round row, its answer window, speed bonus, hints and history are created identically whether you play over WebSocket or HTTP. Socket-local state is keyed by `client.id`, so two tabs of the same user play independently and disconnecting one tab does not affect the other. Authoritative state lives in the database.
+
+| Message        | Payload                                                       | Ack                                                                                                                              |
+| -------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `requestLyric` | `{ sessionId? }`                                              | `{ roundId, issuedAt, answerWindowSeconds, lyric }` — or `{ error }` when the pool is exhausted (`NotFoundException`)          |
+| `submitGuess`  | `{ roundId, guess }`                                          | `{ roundId, isCorrect, points, speedBonus, timedOut, hintsUsed }` — same scoring as `POST /game/guess`                          |
+| `requestHint`  | `{ roundId }`                                                 | `{ roundId, hint, hintsUsed, pointsPenalty }` — same as `POST /game/hint`                                                        |
+
+`requestLyric` returns `roundId`, `issuedAt` and `answerWindowSeconds` so the client can render the countdown; the answer window, hard expiry and anti-replay checks are enforced server-side. `submitGuess` and `requestHint` persist a round and a history row, so every WebSocket guess is scored and recorded exactly like an HTTP one.
+
 ## Where events come from
 
 Services raise events on the in-process `EventEmitter2` bus under the names above (`src/realtime/realtime.events.ts`), and `RealtimeGateway` fans them out. Game rounds raise theirs directly. Session, wager and room changes are picked up by a TypeORM subscriber (`EntityEventsSubscriber`), so anything that saves those rows announces them, and events raised inside a transaction are held until it commits.
 
-## Multiple instances
+### Ack callbacks
 
-Set `REDIS_URL`. `main.ts` then installs `RedisIoAdapter` (`@socket.io/redis-adapter`), so an event raised on one instance reaches sockets connected to any other. Without it the in-memory adapter is used, which is right for a single instance.
+When a client sends an event with an acknowledgement callback, the same
+`{ code, message, details }` object is passed to the ack instead of (or in
+addition to) the `error` event, so callers can handle failures inline.
 
-## Not in this contract
+### Validation failures
 
-Round events raised from an instance other than the one a database change happened on rely on the adapter above. The bus itself is per-process: an event is emitted by the instance that handled the request or ran the query.
+Gateway handlers validate payloads with a `ValidationPipe` configured with an
+exception factory that throws `WsException`. An invalid payload (for example an
+invalid `submitGuess` body) therefore returns a `400`-style error with
+field-level messages over the socket rather than a generic
+`Internal server error`.

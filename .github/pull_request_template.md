@@ -15,6 +15,14 @@
 
 Closes #<!-- issue number -->
 
+## Documentation
+
+- [ ] **Docs updated?** (Required for PRs changing routes, environment variables, or system behaviour)
+  - [ ] `README.md` updated (for environment variables, configuration settings, or general workflows)
+  - [ ] `docs/` updated (for route additions/changes, contract specs, real-time events, or runbooks)
+  - [ ] No documentation updates required (explain why below):
+    <!-- Rationale if this PR does not modify routes, env vars, or behavior -->
+
 ## Checklist
 
 - [ ] All unit tests pass (`npm test`)

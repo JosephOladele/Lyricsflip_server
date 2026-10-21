@@ -40,24 +40,9 @@ other enums use TypeORM's default `<table>_<column>_enum` names. Adding
 `enumName` to those has no effect on the type name, but TypeORM 0.3 then
 reports every such column as changed.
 
-## Upgrading an existing database
+## Complete migration sequence
 
-Back the database up first (see [`BACKUP_STRATEGY.md`](BACKUP_STRATEGY.md)).
-
-**The `migrations` table lists every migration up to
-`CreateGameRoundsTable1788490000000`.** Run `npm run migration:run`. The new
-migration assumes the schema those migrations produce, so it fails, and rolls
-back, if `lyrics` or `game_history` already exist, or if `users` has rows (it
-adds `username` as `NOT NULL` without a default). It also drops and re-adds
-`room_users.userId`. Its old integer values could not reference a UUID user,
-but copy the table first if you need them. In any of those cases, follow the
-next paragraph instead.
-
-**The schema was bootstrapped by hand, from a dump or with `synchronize`.**
-Run `npm run typeorm -- schema:log` to list the statements that would bring the
-database in line with the entities, then apply the ones you need by hand or
-from a reviewed SQL script. When `npm run migration:check` passes, record the
-migrations as applied so `migration:run` does not try to replay them:
+The canonical order of all migrations in `src/migrations/`:
 
 ```sql
 INSERT INTO "migrations" ("timestamp", "name") VALUES
@@ -69,10 +54,26 @@ INSERT INTO "migrations" ("timestamp", "name") VALUES
   (1755077435852, 'AddMockTokenBalanceToUsers1755077435852'),
   (1755077436000, 'AddMultiplayerSupportToGameSessions1755077436000'),
   (1755077437000, 'CreateWagersTable1755077437000'),
+  (1758800000000, 'AddCaseInsensitiveUniqueIndexToUsers1758800000000'),
+  (1758900000000, 'AddSetNullToLyricsCreatedBy1758900000000'),
+  (1759000000000, 'CreateRefreshTokensTable1759000000000'),
+  (1759000000001, 'AddTokenVersionToUsers1759000000001'),
   (1788480000000, 'MigrateWagersToStellarEscrow1788480000000'),
   (1788490000000, 'CreateGameRoundsTable1788490000000'),
-  (1790363455031, 'RepairSchemaToMatchEntities1790363455031');
+  (1790000000000, 'AddLatestStakeHashesToWagers1790000000000'),
+  (1790000000000, 'CreateAuditLogsTable1790000000000'),
+  (1790363455031, 'RepairSchemaToMatchEntities1790363455031'),
+  (1790363500000, 'RenameGossipGodToGossipGuru1790363500000'),
+  (1791000000000, 'AddStakeDeadlineToWagers1791000000000'),
+  (1792000000000, 'AddTimedRoundsHintsAndDailyChallenges1792000000000'),
+  (1793000000000, 'AddDifficultyConstraintAndDefault1793000000000'),
+  (1793000000000, 'AddEmailVerificationAndPasswordReset1793000000000');
 ```
 
-Leave out any row the table already has. Create the table first if it does not
-exist: running `npm run migration:show` creates it.
+## Upgrading an existing database
+
+Back the database up first (see [`BACKUP_STRATEGY.md`](BACKUP_STRATEGY.md)).
+
+Run `npm run migration:run`. If you are bringing an existing database that was
+bootstrapped with `synchronize` in line, run `npm run typeorm -- schema:log` to verify
+the pending DDL, apply matching migrations, and mark them in `migrations` as shown above.
