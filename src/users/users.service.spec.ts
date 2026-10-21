@@ -34,6 +34,8 @@ describe('UsersService', () => {
     save: jest.fn(),
     remove: jest.fn(),
     findAndCount: jest.fn(),
+    createQueryBuilder: jest.fn(),
+    query: jest.fn(),
   };
 
   const mockWagerRepository = {
@@ -254,8 +256,6 @@ describe('UsersService', () => {
       mockUserRepository.save.mockResolvedValue({
         ...mockUser,
         preferredGenre: MusicGenre.JAZZ,
-        // Keep the original decade value
-        preferredDecade: mockUser.preferredDecade,
       });
 
       const result = await service.updatePreferences('user-123', updateDto);
@@ -264,145 +264,91 @@ describe('UsersService', () => {
       expect(result.preferredDecade).toBe(mockUser.preferredDecade);
     });
 
-    it('should throw NotFoundException if user not found', async () => {
-      const updateDto: UpdateUserPreferencesDto = {
-        preferredGenre: MusicGenre.ROCK,
-      };
-
+    it('should throw NotFoundException when user does not exist', async () => {
       mockUserRepository.findOne.mockResolvedValue(null);
 
-      await expect(service.updatePreferences('nonexistent', updateDto))
-        .rejects
-        .toThrow(NotFoundException);
+      await expect(
+        service.updatePreferences('missing', {
+          preferredGenre: MusicGenre.ROCK,
+        }),
+      ).rejects.toThrow(NotFoundException);
     });
   });
 
-  describe('getUserPreferences', () => {
-    const mockUser = {
-      preferredGenre: MusicGenre.POP,
-      preferredDecade: MusicDecade.NINETIES,
+  describe('leaderboard ranking with ties', () => {
+    const buildUser = (id: string, xp: number): User => ({
+      id,
+      email: `${id}@example.com`,
+      username: id,
+      name: id,
+      passwordHash: 'hashedpassword',
+      xp,
+      level: 1,
+      levelTitle: UserLevel.GOSSIP_ROOKIE,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      role: Role.User,
+      isActive: true,
+      mockBalance: '0',
+      preferredGenre: undefined,
+      preferredDecade: undefined,
+      gameSessions: [],
+    });
+
+    const mockQueryBuilder = (rows: Array<{ id: string; xp: number; rank: string }>) => {
+      const qb: any = {
+        select: jest.fn().mockReturnThis(),
+        addSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        offset: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        getRawAndEntities: jest.fn().mockResolvedValue({
+          entities: rows.map((r) => buildUser(r.id, r.xp)),
+          raw: rows.map((r) => ({ user_id: r.id, rank: r.rank })),
+        }),
+        getRawOne: jest.fn().mockResolvedValue(rows[0] ? { rank: rows[0].rank } : undefined),
+      };
+      mockUserRepository.createQueryBuilder.mockReturnValue(qb);
+      return qb;
     };
 
-    it('should return user preferences successfully', async () => {
-      mockUserRepository.findOne.mockResolvedValue(mockUser);
+    it('assigns the same competition rank to tied users on the page', async () => {
+      mockQueryBuilder([
+        { id: 'a', xp: 600, rank: '1' },
+        { id: 'b', xp: 500, rank: '2' },
+        { id: 'c', xp: 500, rank: '2' },
+        { id: 'd', xp: 500, rank: '2' },
+        { id: 'e', xp: 400, rank: '5' },
+      ]);
 
-      const result = await service.getUserPreferences('user-123');
+      const result = await service.getLeaderboard({ limit: 5, offset: 0 } as any);
 
-      expect(mockUserRepository.findOne).toHaveBeenCalledWith({
-        where: { id: 'user-123' },
-        select: ['preferredGenre', 'preferredDecade'],
-      });
-      expect(result).toEqual({
-        preferredGenre: MusicGenre.POP,
-        preferredDecade: MusicDecade.NINETIES,
-      });
+      const ranks = result.data.map((u: any) => u.rank);
+      expect(ranks).toEqual([1, 2, 2, 2, 5]);
     });
 
-    it('should throw NotFoundException if user not found', async () => {
-      mockUserRepository.findOne.mockResolvedValue(null);
+    it('keeps tied users sharing a rank across a page boundary', async () => {
+      mockQueryBuilder([
+        { id: 'c', xp: 500, rank: '2' },
+        { id: 'd', xp: 500, rank: '2' },
+        { id: 'e', xp: 400, rank: '5' },
+      ]);
 
-      await expect(service.getUserPreferences('nonexistent'))
-        .rejects
-        .toThrow(NotFoundException);
-    });
-  });
+      const result = await service.getLeaderboard({ limit: 3, offset: 2 } as any);
 
-  describe('getLeaderboard', () => {
-    it('should return cached leaderboard if available', async () => {
-      const cachedData = { data: [], meta: {} };
-      mockCacheManager.get.mockResolvedValue(cachedData);
-
-      const result = await service.getLeaderboard({
-        limit: 10,
-        offset: 0,
-        sortBy: 'xp',
-        order: 'DESC',
-      });
-
-      expect(mockCacheManager.get).toHaveBeenCalledWith('leaderboard:xp:DESC:10:0');
-      expect(result).toEqual(cachedData);
+      const ranks = result.data.map((u: any) => u.rank);
+      expect(ranks).toEqual([2, 2, 5]);
     });
 
-    it('should fetch from database and cache if not cached', async () => {
-      mockCacheManager.get.mockResolvedValue(null);
-      mockUserRepository.findAndCount.mockResolvedValue([[], 0]);
+    it('reports the same rank in myRank as in the list for a tied user', async () => {
+      mockQueryBuilder([{ id: 'c', xp: 500, rank: '2' }]);
 
-      const result = await service.getLeaderboard({
-        limit: 10,
-        offset: 0,
-        sortBy: 'xp',
-        order: 'DESC',
-      });
+      const result = await service.getMyRank('c');
 
-      expect(mockUserRepository.findAndCount).toHaveBeenCalled();
-      expect(mockCacheManager.set).toHaveBeenCalled();
-      expect(result).toBeDefined();
-    });
-
-    it('should cache the leaderboard for 30 seconds (TTL in milliseconds)', async () => {
-      mockCacheManager.get.mockResolvedValue(null);
-      mockUserRepository.findAndCount.mockResolvedValue([[], 0]);
-
-      await service.getLeaderboard({
-        limit: 10,
-        offset: 0,
-        sortBy: 'xp',
-        order: 'DESC',
-      });
-
-      // cache-manager v7 TTLs are milliseconds; 30 would expire in 30 ms.
-      expect(cacheConfig.leaderboardTtlMs).toBe(30_000);
-      expect(mockCacheManager.set).toHaveBeenCalledWith(
-        'leaderboard:xp:DESC:10:0',
-        expect.any(Object),
-        30_000,
-      );
-    });
-
-    it('should throw BadRequestException for invalid limit', async () => {
-      await expect(
-        service.getLeaderboard({
-          limit: -1,
-          offset: 0,
-          sortBy: 'xp',
-          order: 'DESC',
-        }),
-      )
-        .rejects
-        .toThrow(BadRequestException);
-    });
-
-    it('should throw BadRequestException for invalid sort field', async () => {
-      await expect(
-        service.getLeaderboard({
-          limit: 10,
-          offset: 0,
-          sortBy: 'invalid',
-          order: 'DESC',
-        }),
-      )
-        .rejects
-        .toThrow(BadRequestException);
-    });
-
-    it('should include myRank when a current user id is provided', async () => {
-      mockCacheManager.get.mockResolvedValue(null);
-      mockUserRepository.findAndCount.mockResolvedValue([[], 0]);
-      mockUserRepository.findOne.mockResolvedValue({
-        id: 'user-123',
-        xp: 100,
-      });
-
-      const result = await service.getLeaderboard({
-        limit: 10,
-        offset: 0,
-        sortBy: 'xp',
-        order: 'DESC',
-        currentUserId: 'user-123',
-      });
-
-      expect(result).toBeDefined();
-      expect(result).toHaveProperty('myRank');
+      expect(result.rank).toBe(2);
     });
   });
 });

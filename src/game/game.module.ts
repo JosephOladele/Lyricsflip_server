@@ -9,11 +9,15 @@ import { Lyrics } from 'src/lyrics/entities/lyrics.entity';
 import { GameRound } from './entities/game-round.entity';
 import { GameSession } from 'src/game-sessions/entities/game-session.entity';
 import { GameHistory } from 'src/game-history/entities/game-history.entity';
+import { XpLevelModule } from 'src/xp-level/xp-level.module';
+import { GameHistoryModule } from 'src/game-history/game-history.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Lyrics, GameRound, GameSession, GameHistory]),
     JwtModule.register({}),
+    XpLevelModule,
+    GameHistoryModule,
   ],
   providers: [GameLogicService, GameGateway, DifficultyCalibratorJob],
   controllers: [GameController],
