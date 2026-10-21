@@ -1,4 +1,4 @@
-import { Controller, Post, Body, Param, Get, UseGuards } from '@nestjs/common';
+import { Controller, Post, Body, Param, Get, UseGuards, Query } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -6,15 +6,14 @@ import {
   ApiParam,
   ApiResponse,
   ApiTags,
+  ApiQuery,
 } from '@nestjs/swagger';
-import { Controller, Post, Body, Param, Get, UseGuards, Query } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiQuery } from '@nestjs/swagger';
 import { RoomsService } from './rooms.service';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { GuessLyricDto } from './dto/guess-lyric.dto';
+import { ListRoomsQueryDto } from './dto/list-rooms-query.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { GetUser } from '../auth/decorators/user.decorator';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 
 @ApiTags('rooms')
 @Controller('rooms')
@@ -27,19 +26,19 @@ export class RoomsController {
   @ApiOperation({ summary: 'Create a new room' })
   @ApiBody({ type: CreateRoomDto })
   @ApiResponse({ status: 201, description: 'The room was created.', type: Object })
-  @ApiResponse({ status: 201, description: 'Room created successfully.' })
-  create(@Body() createRoomDto: CreateRoomDto) {
-    return this.roomsService.create(createRoomDto);
+  create(
+    @Body() createRoomDto: CreateRoomDto,
+    @GetUser('id') userId: string,
+  ) {
+    return this.roomsService.create(createRoomDto, userId);
   }
 
   @Post(':roomId/join')
   @ApiOperation({ summary: 'Join an existing room' })
   @ApiParam({ name: 'roomId', description: 'Room identifier' })
   @ApiResponse({ status: 200, description: 'User joined room.', type: Object })
-  @ApiOperation({ summary: 'Join a room by UUID' })
-  @ApiResponse({ status: 201, description: 'Joined room successfully.' })
   @ApiResponse({ status: 404, description: 'Room not found.' })
-  @ApiResponse({ status: 409, description: 'User already joined this room.' })
+  @ApiResponse({ status: 409, description: 'User already joined this room or room is full.' })
   join(
     @Param('roomId') roomId: string,
     @GetUser('id') userId: string,
@@ -51,12 +50,36 @@ export class RoomsController {
   @ApiOperation({ summary: 'Join a room by 6-character short code' })
   @ApiResponse({ status: 201, description: 'Joined room successfully.' })
   @ApiResponse({ status: 404, description: 'Room not found.' })
-  @ApiResponse({ status: 409, description: 'User already joined this room.' })
+  @ApiResponse({ status: 409, description: 'User already joined this room or room is full.' })
   joinByCode(
     @Param('code') code: string,
     @GetUser('id') userId: string,
   ) {
     return this.roomsService.joinByCode(code, userId);
+  }
+
+  @Post(':roomId/start')
+  @ApiOperation({ summary: 'Start a room (host only)' })
+  @ApiParam({ name: 'roomId', description: 'Room identifier' })
+  @ApiResponse({ status: 200, description: 'Room started; rounds issued to all members.' })
+  @ApiResponse({ status: 403, description: 'Only the host can start the room.' })
+  @ApiResponse({ status: 404, description: 'Room not found.' })
+  @ApiResponse({ status: 409, description: 'Room is not in the lobby.' })
+  start(
+    @Param('roomId') roomId: string,
+    @GetUser('id') userId: string,
+  ) {
+    return this.roomsService.start(roomId, userId);
+  }
+
+  @Get(':roomId/results')
+  @ApiOperation({ summary: 'Get the final ranking for a finished room' })
+  @ApiParam({ name: 'roomId', description: 'Room identifier' })
+  @ApiResponse({ status: 200, description: 'Ranked results.', type: Object })
+  @ApiResponse({ status: 404, description: 'Room not found.' })
+  @ApiResponse({ status: 409, description: 'Room is not finished yet.' })
+  getResults(@Param('roomId') roomId: string) {
+    return this.roomsService.getResults(roomId);
   }
 
   @Get()
@@ -65,16 +88,13 @@ export class RoomsController {
   @ApiQuery({ name: 'status', required: false, enum: ['lobby'], description: 'Filter by room status' })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Items per page (default 20, max 100)' })
   @ApiQuery({ name: 'offset', required: false, type: Number, description: 'Number of items to skip (default 0)' })
-  async findOpenRooms(
-    @Query('status') status: string,
-    @Query() pagination: PaginationQueryDto,
-  ) {
+  async findOpenRooms(@Query() query: ListRoomsQueryDto) {
     // Only support status=lobby for now
-    if (status && status !== 'lobby') {
+    if (query.status && query.status !== 'lobby') {
       return { items: [], total: 0 };
     }
-    const limit = pagination.limit ?? 20;
-    const offset = pagination.offset ?? 0;
+    const limit = query.limit ?? 20;
+    const offset = query.offset ?? 0;
     return this.roomsService.findOpenRooms(limit, offset);
   }
 
@@ -82,8 +102,6 @@ export class RoomsController {
   @ApiOperation({ summary: 'Get room status for the current user' })
   @ApiParam({ name: 'roomId', description: 'Room identifier' })
   @ApiResponse({ status: 200, description: 'Room status.', type: Object })
-  @ApiOperation({ summary: 'Get room status' })
-  @ApiResponse({ status: 200, description: 'Room status.' })
   @ApiResponse({ status: 404, description: 'Room not found or user not in room.' })
   getRoomStatus(
     @Param('roomId') roomId: string,
@@ -97,8 +115,6 @@ export class RoomsController {
   @ApiParam({ name: 'roomId', description: 'Room identifier' })
   @ApiBody({ type: GuessLyricDto })
   @ApiResponse({ status: 200, description: 'Guess result.', type: Object })
-  @ApiOperation({ summary: 'Submit a guess for the room' })
-  @ApiResponse({ status: 200, description: 'Guess scored.' })
   @ApiResponse({ status: 404, description: 'Room not found or user not in room.' })
   @ApiResponse({ status: 409, description: 'User already guessed.' })
   submitGuess(

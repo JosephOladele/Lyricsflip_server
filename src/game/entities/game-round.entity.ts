@@ -16,6 +16,7 @@ import {
  * from being replayed for points.
  */
 @Entity('game_rounds')
+@Index('IDX_game_rounds_user_issued', ['userId', 'issuedAt'])
 export class GameRound {
   @PrimaryGeneratedColumn('uuid')
   id: string;

@@ -1,0 +1,42 @@
+groups:
+  - name: lyricsflip_settlement_alerts
+    rules:
+      - alert: WagerReconciliationGiveup
+        expr: increase(lyricsflip_reconcile_giveups_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: settlement
+        annotations:
+          summary: "Wager reconciliation job abandoned a stuck wager"
+          description: "One or more wagers in SETTLING exceeded maximum reconcile attempts and moved to FAILED. Immediate operator review required."
+
+      - alert: WagerStuckSettling
+        expr: lyricsflip_oldest_settling_wager_age_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          component: settlement
+        annotations:
+          summary: "Wager stuck settling on-chain"
+          description: "Oldest wager in SETTLING has been unconfirmed for {{ $value }}s (> 15m). Verify Soroban RPC availability and network congestion."
+
+      - alert: ElevatedSettlementFailures
+        expr: rate(lyricsflip_settlement_failures_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          component: settlement
+        annotations:
+          summary: "Elevated rate of settlement failures"
+          description: "Settlement failures rate is {{ $value }} failures/sec over the last 5 minutes."
+
+      - alert: WagerRefundFailures
+        expr: increase(lyricsflip_refund_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: settlement
+        annotations:
+          summary: "Automated wager refund failed"
+          description: "An automated refund during wager creation or expiry sweep failed to execute cleanly."

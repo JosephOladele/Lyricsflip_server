@@ -7,7 +7,7 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { Logger } from '@nestjs/common';
+import { Logger, UseFilters } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OnEvent } from '@nestjs/event-emitter';
 import { JwtService } from '@nestjs/jwt';
@@ -17,6 +17,7 @@ import { Server, Socket } from 'socket.io';
 import { Repository } from 'typeorm';
 import { GameSession } from '../game-sessions/entities/game-session.entity';
 import { RoomUser } from '../rooms/entities/room-user.entity';
+import { WsExceptionFilter } from '../common/filters/ws-exception.filter';
 import {
   PlayerJoinedPayload,
   RealtimeEvent,
@@ -47,6 +48,7 @@ export type SubscribeAck =
  * adapter enabled (see RedisIoAdapter) an event raised on one instance reaches
  * sockets connected to any other.
  */
+@UseFilters(WsExceptionFilter)
 @WebSocketGateway({
   namespace: '/realtime',
   cors: {
@@ -272,14 +274,12 @@ export class RealtimeGateway
   }
 
   private wagerRooms(payload: {
-    sessionId: string;
-    playerAId: string;
-    playerBId: string;
+    sessionId: string | null;
+    userId: string;
   }): string[] {
     return [
-      realtimeRooms.session(payload.sessionId),
-      realtimeRooms.user(payload.playerAId),
-      realtimeRooms.user(payload.playerBId),
+      realtimeRooms.user(payload.userId),
+      ...(payload.sessionId ? [realtimeRooms.session(payload.sessionId)] : []),
     ];
   }
 }

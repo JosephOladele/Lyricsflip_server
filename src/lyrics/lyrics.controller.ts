@@ -154,8 +154,6 @@ export class LyricsController {
       'decade',
       normalizedDecade,
     );
-    const decadeNum = Number.parseInt(decade, 10);
-    const lyrics = await this.lyricsService.getLyricsByCategory(decadeNum);
     return lyrics.map((lyric) => forCaller(lyric, user));
   }
 
@@ -182,13 +180,27 @@ export class LyricsController {
     required: true,
     description: 'Search term matched against lyric fields',
   })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    description: 'Page number (default: 1)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    description: 'Results per page (default: 20)',
+  })
   @ApiOkResponse({ description: 'Matching lyrics.', type: [AdminLyricDto] })
   @ApiBadRequestResponse({ description: 'The query failed validation.' })
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(Role.Admin)
   @Get('search')
   async search(@Query() query: SearchLyricsQueryDto): Promise<AdminLyricDto[]> {
-    const lyrics = await this.lyricsService.searchLyrics(query.q);
+    const lyrics = await this.lyricsService.searchLyrics(
+      query.q,
+      query.page,
+      query.limit,
+    );
     return lyrics.map((lyric) => AdminLyricDto.from(lyric));
   }
 

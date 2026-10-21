@@ -16,6 +16,17 @@ export const GAME_CONSTANTS = {
       medium: 1.5,
       hard: 2,
     },
+    /**
+     * Maps the stored 1-5 difficulty to a DIFFICULTY_MULTIPLIER key.
+     * 1-2 => easy, 3 => medium, 4-5 => hard.
+     */
+    DIFFICULTY_TIER: {
+      1: 'easy',
+      2: 'easy',
+      3: 'medium',
+      4: 'hard',
+      5: 'hard',
+    },
   },
   LIMITS: {
     MAX_LYRICS_PER_REQUEST: 20,
@@ -36,5 +47,43 @@ export const GAME_CONSTANTS = {
   },
   VALIDATION: {
     MIN_PARTIAL_MATCH_LENGTH: 3,
+  },
+  /**
+   * Token-based partial-match tuning. A guess is only a partial match when it
+   * is similar enough to the answer under one of two rules: token overlap
+   * (Jaccard/Dice) or a length-scaled Levenshtein distance for typos.
+   */
+  MATCHING: {
+    /**
+     * Minimum Jaccard score (|A∩B| / |A∪B|) over normalised tokens. High
+     * enough that a single shared word like "love" or "the" never passes.
+     */
+    MIN_JACCARD: 0.6,
+    /**
+     * Minimum Dice score (2|A∩B| / (|A|+|B|)) over normalised tokens. Slightly
+     * more forgiving than Jaccard for answers with extra words.
+     */
+    MIN_DICE: 0.75,
+    /**
+     * Levenshtein distance allowed for typos, as a fraction of the longer
+     * string's length (e.g. 0.2 → 1 typo per 5 characters).
+     */
+    MAX_LEVENSHTEIN_RATIO: 0.2,
+    /** Absolute floor for the typo distance so short answers still allow 1. */
+    MIN_LEVENSHTEIN_DISTANCE: 1,
+    /**
+     * Words ignored when comparing tokens: articles, conjunctions and the
+     * "feat."/"ft." markers that introduce featuring artists.
+     */
+    STOP_WORDS: [
+      'the',
+      'a',
+      'an',
+      'of',
+      'and',
+      'feat',
+      'featuring',
+      'ft',
+    ],
   },
 } as const;

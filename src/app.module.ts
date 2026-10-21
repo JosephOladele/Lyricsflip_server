@@ -26,6 +26,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { XpModule } from './xp-level/xp.module';
 import { AuditModule } from './audit/audit.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { AchievementsModule } from './achievements/achievements.module';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ThrottlerModule } from '@nestjs/throttler';
@@ -53,18 +54,23 @@ import type { LoggingOptions } from 'typeorm';
     //    share the same cache and invalidation propagates across pods.
     //    When unset (local dev, CI) the default in-memory store is used as a
     //    fallback — no Redis required to run locally.
+    //
+    //    The in-memory entry cap is configurable via CACHE_MAX_ITEMS (#341).
+    //    For Redis, configure `maxmemory-policy allkeys-lru` on the server
+    //    (see README) — the `max` option is ignored by Redis stores.
     CacheModule.registerAsync({
       isGlobal: true,
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: async (configService: ConfigService) => {
         const redisUrl = configService.get<string>('REDIS_URL');
+        const maxItems = cacheConfig.getMaxItems(configService);
 
         if (redisUrl) {
           const { default: KeyvRedis } = await import('@keyv/redis');
           return {
             ttl: cacheConfig.defaultTtlMs,
-            max: cacheConfig.maxItems,
+            max: maxItems,
             stores: [new KeyvRedis(redisUrl)],
           };
         }
@@ -72,7 +78,7 @@ import type { LoggingOptions } from 'typeorm';
         // In-memory fallback (single instance / local dev)
         return {
           ttl: cacheConfig.defaultTtlMs,
-          max: cacheConfig.maxItems,
+          max: maxItems,
         };
       },
     }),
@@ -208,22 +214,35 @@ import type { LoggingOptions } from 'typeorm';
     NotificationsModule,
     XpModule,
     AuditModule,
-    HealthModule,
     MetricsModule,
+    AchievementsModule,
   ],
   controllers: [AppController],
   providers: [
-    { provide: APP_FILTER, useClass: AllExceptionsFilter },
-    { provide: APP_GUARD, useClass: AppThrottlerGuard },
-    { provide: APP_GUARD, useClass: JwtAuthGuard },
-    { provide: APP_GUARD, useClass: RolesGuard },
-    { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: AppThrottlerGuard,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: LoggingInterceptor,
+    },
   ],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    // Reads or generates x-request-id for every request and stores it in
-    // AsyncLocalStorage so every Winston log line includes it (#200).
     consumer.apply(RequestIdMiddleware).forRoutes('*');
   }
 }

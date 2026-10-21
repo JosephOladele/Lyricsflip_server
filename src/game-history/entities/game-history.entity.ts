@@ -13,6 +13,7 @@ import { GameSession } from '../../game-sessions/entities/game-session.entity';
 import { GuessType } from '../../game/dto/guess.dto';
 
 @Entity('game_history')
+@Index(['createdAt', 'playerId'])
 export class GameHistory {
   @PrimaryGeneratedColumn('uuid')
   id: string;
