@@ -25,6 +25,33 @@ A head-to-head match is created when a head-to-head session is accepted. The ser
 | `match.aborted` | `{ sessionId, reason }` | The match was cleanly aborted (e.g. server restart could not resume). Wagers are refunded. |
 
 ### Events (client → server)
+# Realtime (WebSocket) API
+
+This document describes the WebSocket error contract used by the game and
+realtime gateways.
+
+## Error contract
+
+All errors emitted over the socket share a single shape:
+
+```json
+{
+  "event": "error",
+  "data": {
+    "code": 400,
+    "message": "Validation failed",
+    "details": [
+      { "field": "guess", "message": "guess must be a string" }
+    ]
+  }
+}
+```
+
+- `code` — numeric status code (HTTP-style, e.g. `400`, `403`, `500`).
+- `message` — human-readable summary.
+- `details` — optional array of field-level messages (present for validation
+  failures).
+## Rooms
 
 | Event | Payload | Description |
 | --- | --- | --- |
@@ -52,6 +79,19 @@ A head-to-head match is created when a head-to-head session is accepted. The ser
 Match state (shared lyric set, current round, per-round results, scores, ready flags, and deadlines) is persisted so that a server restart mid-match can either resume the match from the last completed round or cleanly abort it. On abort the server emits `match.aborted` and refunds any wagers associated with the session.
 
 ## Sequence diagram
+## `/game` gateway messages (client → server)
+
+The `/game` namespace runs the same round loop as the HTTP API: every message is backed by `GameLogicService`, so a round row, its answer window, speed bonus, hints and history are created identically whether you play over WebSocket or HTTP. Socket-local state is keyed by `client.id`, so two tabs of the same user play independently and disconnecting one tab does not affect the other. Authoritative state lives in the database.
+
+| Message        | Payload                                                       | Ack                                                                                                                              |
+| -------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `requestLyric` | `{ sessionId? }`                                              | `{ roundId, issuedAt, answerWindowSeconds, lyric }` — or `{ error }` when the pool is exhausted (`NotFoundException`)          |
+| `submitGuess`  | `{ roundId, guess }`                                          | `{ roundId, isCorrect, points, speedBonus, timedOut, hintsUsed }` — same scoring as `POST /game/guess`                          |
+| `requestHint`  | `{ roundId }`                                                 | `{ roundId, hint, hintsUsed, pointsPenalty }` — same as `POST /game/hint`                                                        |
+
+`requestLyric` returns `roundId`, `issuedAt` and `answerWindowSeconds` so the client can render the countdown; the answer window, hard expiry and anti-replay checks are enforced server-side. `submitGuess` and `requestHint` persist a round and a history row, so every WebSocket guess is scored and recorded exactly like an HTTP one.
+
+## Where events come from
 
 ```mermaid
 sequenceDiagram
@@ -102,3 +142,16 @@ sequenceDiagram
         S-->>A: session.completed (winnerId=A)
     end
 ```
+### Ack callbacks
+
+When a client sends an event with an acknowledgement callback, the same
+`{ code, message, details }` object is passed to the ack instead of (or in
+addition to) the `error` event, so callers can handle failures inline.
+
+### Validation failures
+
+Gateway handlers validate payloads with a `ValidationPipe` configured with an
+exception factory that throws `WsException`. An invalid payload (for example an
+invalid `submitGuess` body) therefore returns a `400`-style error with
+field-level messages over the socket rather than a generic
+`Internal server error`.

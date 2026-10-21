@@ -230,7 +230,8 @@ A contribution is ready to merge when all of the following are true:
 - [ ] Lint passes with no errors (`npm run lint:check`).
 - [ ] TypeScript compiles without errors (`npx tsc --noEmit`).
 - [ ] A migration is included if any entity was changed.
-- [ ] Relevant documentation (README, docs/) is updated.
+- [ ] Relevant documentation (README, docs/) is updated — required for any change to routes, environment variables, or runtime behavior.
+- [ ] "Docs updated?" checkbox in the pull request template is completed.
 - [ ] No secrets, credentials, or `.env` files are committed.
 - [ ] All acceptance criteria listed on the linked issue are met.
 

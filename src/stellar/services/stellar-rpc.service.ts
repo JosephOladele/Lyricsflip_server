@@ -299,70 +299,108 @@ export class StellarRpcService {
     return result;
   }
 
+function getTelemetryTracer() {
+  try {
+    const api = require('@opentelemetry/api');
+    return api.trace.getTracer('stellar-rpc');
+  } catch {
+    return {
+      startSpan: () => ({
+        setAttribute: () => {},
+        setAttributes: () => {},
+        setStatus: () => {},
+        recordException: () => {},
+        end: () => {},
+      }),
+    };
+  }
+}
+
   /** Submits an already-signed transaction and waits for confirmation. */
   async submit(transaction: Transaction): Promise<SubmitResult> {
     const hash = this.hashHex(transaction);
     const start = Date.now();
+    const tracer = getTelemetryTracer();
+    const span = tracer.startSpan('StellarRpcService.submit');
+    span.setAttribute('transaction_hash', hash);
+    span.setAttribute('transaction.hash', hash);
 
     const maxRetries = envInt('STELLAR_TRY_AGAIN_MAX_ATTEMPTS', 5);
     const baseDelayMs = envInt('STELLAR_TRY_AGAIN_BASE_DELAY_MS', 500);
 
     let sent: rpc.Api.SendTransactionResponse;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        sent = await this.server.sendTransaction(transaction);
-      } catch (error) {
-        this.metricsService?.rpcCallErrors.inc({ method: 'submit' });
-        return {
-          hash,
-          confirmed: false,
-          error: `Submission failed: ${(error as Error).message}`,
-        };
+    let attemptCount = 0;
+    try {
+      for (let attempt = 0; ; attempt++) {
+        attemptCount = attempt + 1;
+        span.setAttribute('attempt_count', attemptCount);
+        try {
+          sent = await this.server.sendTransaction(transaction);
+        } catch (error) {
+          span.recordException?.(error);
+          span.setStatus?.({ code: 2, message: (error as Error).message });
+          this.metricsService?.rpcCallErrors.inc({ method: 'submit' });
+          return {
+            hash,
+            confirmed: false,
+            error: `Submission failed: ${(error as Error).message}`,
+          };
+        }
+
+        // TRY_AGAIN_LATER means the queue is full and the transaction was NOT
+        // accepted, so polling for it is pointless: back off and resubmit.
+        if (sent.status !== 'TRY_AGAIN_LATER') break;
+
+        if (attempt >= maxRetries) {
+          const err = `Network queue still full after ${attempt + 1} submissions (TRY_AGAIN_LATER)`;
+          span.setStatus?.({ code: 2, message: err });
+          this.metricsService?.rpcCallErrors.inc({ method: 'submit' });
+          return {
+            hash,
+            confirmed: false,
+            error: err,
+          };
+        }
+
+        await this.sleep(baseDelayMs * 2 ** attempt);
       }
 
-      // TRY_AGAIN_LATER means the queue is full and the transaction was NOT
-      // accepted, so polling for it is pointless: back off and resubmit.
-      if (sent.status !== 'TRY_AGAIN_LATER') break;
-
-      if (attempt >= maxRetries) {
-        this.metricsService?.rpcCallErrors.inc({ method: 'submit' });
-        return {
-          hash,
-          confirmed: false,
-          error: `Network queue still full after ${attempt + 1} submissions (TRY_AGAIN_LATER)`,
-        };
+      if (sent.status === 'ERROR' || sent.status === 'DUPLICATE') {
+        // DUPLICATE means this exact transaction is already in flight, which for
+        // our idempotent flows is not an error — fall through to polling.
+        if (sent.status === 'ERROR') {
+          const errDetail = `Network rejected the transaction: ${JSON.stringify(sent.errorResult ?? {})}`;
+          span.setStatus?.({ code: 2, message: errDetail });
+          const errResult = {
+            hash: sent.hash,
+            confirmed: false,
+            error: errDetail,
+          };
+          this.metricsService?.rpcCallDuration.observe(
+            { method: 'submit', success: 'false' },
+            (Date.now() - start) / 1000,
+          );
+          this.metricsService?.rpcCallErrors.inc({ method: 'submit' });
+          return errResult;
+        }
       }
 
-      await this.sleep(baseDelayMs * 2 ** attempt);
-    }
-
-    if (sent.status === 'ERROR' || sent.status === 'DUPLICATE') {
-      // DUPLICATE means this exact transaction is already in flight, which for
-      // our idempotent flows is not an error — fall through to polling.
-      if (sent.status === 'ERROR') {
-        const errResult = {
-          hash: sent.hash,
-          confirmed: false,
-          error: `Network rejected the transaction: ${JSON.stringify(sent.errorResult ?? {})}`,
-        };
-        this.metricsService?.rpcCallDuration.observe(
-          { method: 'submit', success: 'false' },
-          (Date.now() - start) / 1000,
-        );
+      const result = await this.waitForConfirmation(sent.hash);
+      this.metricsService?.rpcCallDuration.observe(
+        { method: 'submit', success: result.confirmed ? 'true' : 'false' },
+        (Date.now() - start) / 1000,
+      );
+      if (!result.confirmed) {
+        span.setStatus?.({ code: 2, message: result.error ?? 'Unconfirmed' });
         this.metricsService?.rpcCallErrors.inc({ method: 'submit' });
-        return errResult;
+      } else {
+        span.setStatus?.({ code: 1 });
       }
+      return result;
+    } finally {
+      span.setAttribute('attempt_count', attemptCount);
+      span.end();
     }
-
-    const result = await this.waitForConfirmation(sent.hash);
-    this.metricsService?.rpcCallDuration.observe(
-      { method: 'submit', success: result.confirmed ? 'true' : 'false' },
-      (Date.now() - start) / 1000,
-    );
-    if (!result.confirmed) {
-      this.metricsService?.rpcCallErrors.inc({ method: 'submit' });
-    }
-    return result;
   }
 
   /**
@@ -373,9 +411,16 @@ export class StellarRpcService {
    * caller must reconcile it later instead of paying out twice.
    */
   async waitForConfirmation(hash: string): Promise<SubmitResult> {
+    const tracer = getTelemetryTracer();
+    const span = tracer.startSpan('StellarRpcService.waitForConfirmation');
+    span.setAttribute('transaction_hash', hash);
+    span.setAttribute('transaction.hash', hash);
+    const pollAttempts = envInt('STELLAR_POLL_ATTEMPTS', 15);
+    span.setAttribute('attempt_count', pollAttempts);
+
     try {
       const result = await this.server.pollTransaction(hash, {
-        attempts: envInt('STELLAR_POLL_ATTEMPTS', 15),
+        attempts: pollAttempts,
         sleepStrategy:
           process.env.STELLAR_POLL_SLEEP_STRATEGY === 'basic'
             ? rpc.BasicSleepStrategy
@@ -383,6 +428,7 @@ export class StellarRpcService {
       });
 
       if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+        span.setStatus?.({ code: 1 });
         this.logger.log(
           `Transaction ${hash} settled in ledger ${result.ledger}; fee charged ${this.feeCharged(result)} stroops`,
         );
@@ -397,11 +443,13 @@ export class StellarRpcService {
       }
 
       if (result.status === rpc.Api.GetTransactionStatus.FAILED) {
+        const err = `Transaction failed on-chain: ${JSON.stringify(result.resultXdr?.toXDR('base64') ?? '')}`;
+        span.setStatus?.({ code: 2, message: err });
         return {
           hash,
           confirmed: false,
           ledger: result.ledger,
-          error: `Transaction failed on-chain: ${JSON.stringify(result.resultXdr?.toXDR('base64') ?? '')}`,
+          error: err,
         };
       }
 
@@ -410,18 +458,24 @@ export class StellarRpcService {
           'Leaving it for reconciliation rather than assuming failure.',
       );
 
+      const unconfirmedErr =
+        'Transaction not yet visible on the network; awaiting reconciliation';
+      span.setStatus?.({ code: 2, message: unconfirmedErr });
       return {
         hash,
         confirmed: false,
-        error:
-          'Transaction not yet visible on the network; awaiting reconciliation',
+        error: unconfirmedErr,
       };
     } catch (error) {
+      span.recordException?.(error);
+      span.setStatus?.({ code: 2, message: (error as Error).message });
       return {
         hash,
         confirmed: false,
         error: `Could not confirm transaction: ${(error as Error).message}`,
       };
+    } finally {
+      span.end();
     }
   }
 

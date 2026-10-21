@@ -26,6 +26,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { XpModule } from './xp-level/xp.module';
 import { AuditModule } from './audit/audit.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { AchievementsModule } from './achievements/achievements.module';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ThrottlerModule } from '@nestjs/throttler';
@@ -208,22 +209,35 @@ import type { LoggingOptions } from 'typeorm';
     NotificationsModule,
     XpModule,
     AuditModule,
-    HealthModule,
     MetricsModule,
+    AchievementsModule,
   ],
   controllers: [AppController],
   providers: [
-    { provide: APP_FILTER, useClass: AllExceptionsFilter },
-    { provide: APP_GUARD, useClass: AppThrottlerGuard },
-    { provide: APP_GUARD, useClass: JwtAuthGuard },
-    { provide: APP_GUARD, useClass: RolesGuard },
-    { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: AppThrottlerGuard,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: LoggingInterceptor,
+    },
   ],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    // Reads or generates x-request-id for every request and stores it in
-    // AsyncLocalStorage so every Winston log line includes it (#200).
     consumer.apply(RequestIdMiddleware).forRoutes('*');
   }
 }

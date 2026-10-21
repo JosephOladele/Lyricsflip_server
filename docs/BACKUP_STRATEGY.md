@@ -1,41 +1,56 @@
-PostgreSQL Backup and Recovery Plan
-This document outlines the strategy for backing up and recovering the application's PostgreSQL database using standard command-line tools.
+# PostgreSQL Backup and Recovery Plan
 
-1. Automated Backups
-Automated backups are essential for data safety. The recommended approach is to use pg_dump in a scheduled script (e.g., a cron job on a Linux server) to create regular backups.
+This document outlines the backup and disaster recovery procedures for the Lyricsflip PostgreSQL database.
 
-Backup Command:
+## 1. Automated Backups
 
-This command will dump the entire database into a single compressed file. You should run this on your database server or a machine with secure access to it.
+Lyricsflip stores user accounts, game sessions, wagers, and audit trails in PostgreSQL. Regular automated backups must be scheduled (e.g. daily via cron or cloud managed snapshots).
 
-# This command connects to the database and outputs a compressed SQL file.
-# The file is timestamped for easy identification.
-pg_dump -U your_db_user -h localhost your_db_name | gzip > backup_$(date +%Y-%m-%d_%H-%M-%S).sql.gz
+### Backup Command
 
-You will be prompted for your database password. For automated scripts, use a .pgpass file to store credentials securely.
+Using discrete environment variables from `.env` (`DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_NAME`):
 
-Recommendation: Schedule this command to run at least once daily during off-peak hours. Store the backup files in a secure, remote location (like Amazon S3, Google Cloud Storage, or another server).
+```bash
+# Dump the database into a compressed SQL archive
+PGPASSWORD="${DB_PASSWORD}" pg_dump \
+  -h "${DB_HOST}" \
+  -p "${DB_PORT:-5432}" \
+  -U "${DB_USERNAME}" \
+  -F c -b -v \
+  -f "/backups/lyricflip_$(date +%Y-%m-%d_%H-%M-%S).dump" \
+  "${DB_NAME}"
+```
 
-2. Recovery Procedure
-Recovery is the process of restoring the database from a backup file. This is performed when you need to recover from data loss.
+For containerized environments (Docker Compose):
 
-Recovery Command:
+```bash
+docker compose exec -T postgres pg_dump -U postgres -F c test | gzip > backup_$(date +%Y-%m-%d).dump.gz
+```
 
-First, you would typically drop the existing database to ensure a clean restore. Then, you recreate it and restore the data from your backup file.
+Store backup archives off-site in encrypted object storage (S3, GCS) with a 30-day lifecycle retention policy.
 
-# 1. Connect to psql
-psql -U your_db_user -h localhost
+## 2. Disaster Recovery Procedure
 
-# 2. (Inside psql) Drop the old database if it exists
-DROP DATABASE your_db_name;
+To restore the database from a custom-format dump archive:
 
-# 3. (Inside psql) Re-create the database
-CREATE DATABASE your_db_name WITH OWNER your_db_user;
+```bash
+# 1. Terminate active backend connections to the target database
+psql -h "${DB_HOST}" -U "${DB_USERNAME}" -d postgres -c \
+  "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${DB_NAME}' AND pid <> pg_backend_pid();"
 
-# 4. Exit psql
-\q
+# 2. Re-create the database
+dropdb -h "${DB_HOST}" -U "${DB_USERNAME}" "${DB_NAME}"
+createdb -h "${DB_HOST}" -U "${DB_USERNAME}" "${DB_NAME}"
 
-# 5. Restore the database from your backup file
-gunzip < your_backup_file.sql.gz | psql -U your_db_user -h localhost your_db_name
+# 3. Restore the dump
+pg_restore -h "${DB_HOST}" -p "${DB_PORT:-5432}" -U "${DB_USERNAME}" -d "${DB_NAME}" -v "/backups/lyricflip_backup.dump"
+```
 
-Important: Always test your recovery procedure periodically in a non-production environment to ensure your backups are valid and the process works as expected.
+## 3. Post-Recovery Verification
+
+After restoration, verify migrations and entity parity:
+
+```bash
+npm run migration:check
+curl -s http://localhost:3000/health/ready
+```

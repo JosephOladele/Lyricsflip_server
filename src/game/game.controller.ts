@@ -235,7 +235,27 @@ export class GameController {
   /**
    * POST /game/rounds/:id/hint - Reveal the next hint for an open round.
    * Each hint reduces the points the round can score.
+   *
+   * Hint levels (each reveals new information not already shown with the round):
+   * 1. Genre plus the number of words in the song title.
+   * 2. The decade the song was released in.
+   * 3. The first letter of the song title.
    */
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary: 'Reveal the next hint for an open round',
+    description:
+      'Reveals the next hint level for the round and reduces the round\'s ' +
+      'scoreable points. Level 1 reveals the genre and the number of words in ' +
+      'the song title, level 2 reveals the decade, and level 3 reveals the ' +
+      'first letter of the song title. Each level reveals information the ' +
+      'player did not already have.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'The revealed hint and the remaining scoreable points.',
+    type: Object,
+  })
   @Post('rounds/:id/hint')
   @HttpCode(HttpStatus.OK)
   async useHint(

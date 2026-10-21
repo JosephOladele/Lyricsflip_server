@@ -6,6 +6,7 @@ import { Wager, WagerStatus } from '../entities/wager.entity';
 import { GameSession, GameSessionStatus } from '../../game-sessions/entities/game-session.entity';
 import { WagerService } from './wager.service';
 import { JobLockService } from '../../jobs/job-lock.service';
+import { runWithRootSpan } from './wager-reconcile.job';
 
 /**
  * Refunds wagers whose pot has been open too long with at least one player
@@ -62,7 +63,16 @@ export class WagerRefundJob {
     );
 
     for (const wager of expired) {
-      await this.refundOne(wager);
+      await runWithRootSpan(
+        'job.wager_refund.run',
+        {
+          'wager.id': wager.id,
+          'wager_id': wager.id,
+          'session.id': wager.sessionId,
+          'session_id': wager.sessionId,
+        },
+        () => this.refundOne(wager),
+      );
     }
   }
 

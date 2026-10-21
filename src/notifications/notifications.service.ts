@@ -1,5 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, LessThan } from 'typeorm';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { 
   NotificationPayload, 
   LevelUpNotificationPayload, 
@@ -11,13 +14,34 @@ import {
   CreateChallengeNotificationDto, 
   CreateAchievementNotificationDto 
 } from './dto/create-notification.dto';
+import { Notification } from './entities/notification.entity';
+import { RealtimeRoomsService } from '../realtime/realtime-rooms.service';
+
+const RETENTION_DAYS = 90;
+
+export interface NotificationQueryOptions {
+  page?: number;
+  limit?: number;
+  unreadOnly?: boolean;
+}
+
+export interface PaginatedNotifications {
+  data: Notification[];
+  total: number;
+  page: number;
+  limit: number;
+}
 
 @Injectable()
 export class NotificationsService {
   private readonly logger = new Logger(NotificationsService.name);
-  private notifications: NotificationPayload[] = [];
 
-  constructor(private eventEmitter: EventEmitter2) {}
+  constructor(
+    private eventEmitter: EventEmitter2,
+    @InjectRepository(Notification)
+    private readonly notificationRepository: Repository<Notification>,
+    private readonly realtimeRooms: RealtimeRoomsService,
+  ) {}
 
   // Event emission methods
   emitLevelUpEvent(dto: CreateLevelUpNotificationDto): void {
@@ -71,44 +95,104 @@ export class NotificationsService {
 
   // Event listeners
   @OnEvent('user.leveled_up')
-  handleLevelUpEvent(payload: LevelUpNotificationPayload): void {
+  async handleLevelUpEvent(payload: LevelUpNotificationPayload): Promise<void> {
     this.logger.log(`🎉 Level up notification: ${payload.message}`);
-    this.storeNotification(payload);
+    await this.storeNotification('level_up', payload);
   }
 
   @OnEvent('user.completed_challenge')
-  handleChallengeCompletedEvent(payload: ChallengeCompletedNotificationPayload): void {
+  async handleChallengeCompletedEvent(payload: ChallengeCompletedNotificationPayload): Promise<void> {
     this.logger.log(`🔥 Challenge completed notification: ${payload.message}`);
-    this.storeNotification(payload);
+    await this.storeNotification('challenge_completed', payload);
   }
 
   @OnEvent('user.achievement_unlocked')
-  handleAchievementEvent(payload: GameAchievementNotificationPayload): void {
+  async handleAchievementEvent(payload: GameAchievementNotificationPayload): Promise<void> {
     this.logger.log(`🏆 Achievement notification: ${payload.message}`);
-    this.storeNotification(payload);
+    await this.storeNotification('achievement_unlocked', payload);
   }
 
   // Storage methods
-  private storeNotification(notification: NotificationPayload): void {
-    this.notifications.push(notification);
-    this.logger.log(`Stored notification: ${notification.message}`);
+  private async storeNotification(type: string, notification: NotificationPayload): Promise<Notification> {
+    const entity = this.notificationRepository.create({
+      userId: notification.userId,
+      type,
+      payload: notification as unknown as Record<string, unknown>,
+      readAt: null,
+    });
+
+    const saved = await this.notificationRepository.save(entity);
+    this.logger.log(`Stored notification ${saved.id}: ${notification.message}`);
+
+    this.realtimeRooms.user(notification.userId).emit('notification', saved);
+
+    return saved;
   }
 
   // Retrieval methods
-  getNotificationsForUser(userId: string): NotificationPayload[] {
-    return this.notifications.filter(n => n.userId === userId);
+  async getNotificationsForUser(
+    userId: string,
+    options: NotificationQueryOptions = {},
+  ): Promise<PaginatedNotifications> {
+    const page = Math.max(1, options.page ?? 1);
+    const limit = Math.min(100, Math.max(1, options.limit ?? 20));
+
+    const where: Record<string, unknown> = { userId };
+    if (options.unreadOnly) {
+      where.readAt = null;
+    }
+
+    const [data, total] = await this.notificationRepository.findAndCount({
+      where,
+      order: { createdAt: 'DESC' },
+      skip: (page - 1) * limit,
+      take: limit,
+    });
+
+    return { data, total, page, limit };
   }
 
-  getAllNotifications(): NotificationPayload[] {
-    return [...this.notifications];
+  async markAsRead(userId: string, id: string): Promise<Notification | null> {
+    const notification = await this.notificationRepository.findOne({
+      where: { id, userId },
+    });
+
+    if (!notification) {
+      return null;
+    }
+
+    if (!notification.readAt) {
+      notification.readAt = new Date();
+      await this.notificationRepository.save(notification);
+    }
+
+    return notification;
   }
 
-  clearNotifications(): void {
-    this.notifications = [];
-    this.logger.log('All notifications cleared');
+  async markAllAsRead(userId: string): Promise<number> {
+    const result = await this.notificationRepository.update(
+      { userId, readAt: null },
+      { readAt: new Date() },
+    );
+
+    return result.affected ?? 0;
   }
 
-  // Mock data generation
+  // Retention job: delete read notifications older than the retention window
+  @Cron(CronExpression.EVERY_DAY_AT_3AM)
+  async purgeOldNotifications(): Promise<void> {
+    const cutoff = new Date(Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000);
+
+    const result = await this.notificationRepository.delete({
+      readAt: LessThan(cutoff),
+    });
+
+    this.logger.log(
+      `Purged ${result.affected ?? 0} read notifications older than ${RETENTION_DAYS} days`,
+    );
+  }
+
+  // Mock data generation (non-production only; writes through the same path)
   generateMockNotifications(): void {
     const mockUserId = 'mock-user-123';
     
@@ -116,7 +200,7 @@ export class NotificationsService {
     this.emitLevelUpEvent({
       userId: mockUserId,
       newLevel: 5,
-      newTitle: 'Gossip Queen',
+      newTitle: 'Rising Star',
       xpGained: 100,
     });
 
@@ -136,4 +220,4 @@ export class NotificationsService {
       reward: 'Speed boost',
     });
   }
-} 
+}
