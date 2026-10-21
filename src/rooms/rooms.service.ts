@@ -112,12 +112,9 @@ export class RoomsService {
       }
       lyric = foundLyric;
     } else {
-      // Get a random lyric
-      const foundLyric = await this.lyricsRepository
-        .createQueryBuilder('lyrics')
-        .where('lyrics.isActive = :isActive', { isActive: true })
-        .orderBy('RANDOM()')
-        .getOne();
+      // Get a random lyric using a random-key technique instead of
+      // ORDER BY RANDOM(), which forces Postgres to read and sort every row.
+      const foundLyric = await this.pickRandomLyric();
       if (!foundLyric) {
         throw new NotFoundException('No lyrics available');
       }
@@ -146,6 +143,46 @@ export class RoomsService {
   }
 
   /**
+   * Pick a random active lyric without a full-table sort.
+   *
+   * Uses random ID ranges with a retry: pick a random id in [minId, maxId],
+   * then fetch the first active lyric at or after it. This is O(log n) with
+   * the primary-key index instead of ORDER BY RANDOM()'s O(n log n).
+   */
+  private async pickRandomLyric(): Promise<Lyrics | null> {
+    const bounds = await this.lyricsRepository
+      .createQueryBuilder('lyrics')
+      .select('MIN(lyrics.id)', 'min')
+      .addSelect('MAX(lyrics.id)', 'max')
+      .where('lyrics.isActive = :isActive', { isActive: true })
+      .getRawOne<{ min: string | null; max: string | null }>();
+
+    const min = bounds?.min ? Number(bounds.min) : null;
+    const max = bounds?.max ? Number(bounds.max) : null;
+    if (min === null || max === null) {
+      return null;
+    }
+
+    const attempts = 5;
+    for (let i = 0; i < attempts; i++) {
+      const randomId = min + Math.floor(Math.random() * (max - min + 1));
+      const lyric = await this.lyricsRepository
+        .createQueryBuilder('lyrics')
+        .where('lyrics.isActive = :isActive', { isActive: true })
+        .andWhere('lyrics.id >= :randomId', { randomId })
+        .orderBy('lyrics.id', 'ASC')
+        .getOne();
+      if (lyric) {
+        return lyric;
+      }
+    }
+
+    // Fallback: wrap around to the lowest active lyric.
+    return this.lyricsRepository
+      .createQueryBuilder('lyrics')
+      .where('lyrics.isActive = :isActive', { isActive: true })
+      .orderBy('lyrics.id', 'ASC')
+      .getOne();
    * Clamp the requested player cap into the allowed range.
    */
   private normalizeMaxPlayers(requested?: number): number {
