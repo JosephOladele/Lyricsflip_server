@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { EventEmitter2 } from '@nestjs/event-emitter';
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
 
 /**
  * Achievement definition identifiers.
@@ -8,7 +8,8 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 export type AchievementCode =
   | 'first_win'
   | 'perfect_guess'
-  | 'streak'
+  | 'streak_5'
+  | 'streak_10'
   | 'speed_demon';
 
 export interface AchievementDefinition {
@@ -33,9 +34,14 @@ export const ACHIEVEMENT_DEFINITIONS: AchievementDefinition[] = [
     description: 'Answer your first question correctly.',
   },
   {
-    code: 'streak',
+    code: 'streak_5',
     name: 'On Fire',
-    description: 'Reach a streak of 5 or 10 correct answers.',
+    description: 'Reach a streak of 5 correct answers.',
+  },
+  {
+    code: 'streak_10',
+    name: 'Unstoppable',
+    description: 'Reach a streak of 10 correct answers.',
   },
   {
     code: 'speed_demon',
@@ -47,8 +53,17 @@ export const ACHIEVEMENT_DEFINITIONS: AchievementDefinition[] = [
 /** Threshold (ms) under which a correct answer counts as a fast answer. */
 export const SPEED_DEMON_THRESHOLD_MS = 3000;
 
-/** Streak milestones that unlock the `streak` achievement. */
-export const STREAK_MILESTONES = [5, 10];
+/**
+ * Streak milestones mapped to their dedicated achievement codes. Each
+ * milestone has its own code so both can be awarded independently (issue #321).
+ */
+export const STREAK_MILESTONES: ReadonlyArray<{
+  milestone: number;
+  code: AchievementCode;
+}> = [
+  { milestone: 5, code: 'streak_5' },
+  { milestone: 10, code: 'streak_10' },
+];
 
 /**
  * Minimal persistence contract. The concrete implementation is backed by the
@@ -93,6 +108,23 @@ export interface GameplayEvent {
   answerTimeMs?: number;
 }
 
+/**
+ * Payload emitted on the `round.ended` gameplay event. Game code emits this
+ * instead of calling the service directly, keeping the two decoupled.
+ */
+export interface RoundEndedEvent {
+  userId: string;
+  correctAnswer?: boolean;
+  streak?: number;
+  answerTimeMs?: number;
+}
+
+/** Payload emitted on the `wager.settled` gameplay event. */
+export interface WagerSettledEvent {
+  userId: string;
+  won: boolean;
+}
+
 @Injectable()
 export class AchievementsService {
   private readonly logger = new Logger(AchievementsService.name);
@@ -115,6 +147,29 @@ export class AchievementsService {
     return ACHIEVEMENT_DEFINITIONS.filter((definition) =>
       unlocked.has(definition.code),
     );
+  }
+
+  /**
+   * Subscribe to `round.ended` gameplay events. Game code emits the event
+   * rather than calling the service, so achievements stay decoupled.
+   */
+  @OnEvent('round.ended', { async: true })
+  async onRoundEnded(event: RoundEndedEvent): Promise<void> {
+    await this.handleGameplayEvent({
+      userId: event.userId,
+      correctAnswer: event.correctAnswer,
+      streak: event.streak,
+      answerTimeMs: event.answerTimeMs,
+    });
+  }
+
+  /** Subscribe to `wager.settled` gameplay events. */
+  @OnEvent('wager.settled', { async: true })
+  async onWagerSettled(event: WagerSettledEvent): Promise<void> {
+    await this.handleGameplayEvent({
+      userId: event.userId,
+      wagerWon: event.won,
+    });
   }
 
   /**
@@ -144,11 +199,12 @@ export class AchievementsService {
       codes.push('perfect_guess');
     }
 
-    if (
-      typeof event.streak === 'number' &&
-      STREAK_MILESTONES.some((milestone) => event.streak! >= milestone)
-    ) {
-      codes.push('streak');
+    if (typeof event.streak === 'number') {
+      for (const { milestone, code } of STREAK_MILESTONES) {
+        if (event.streak >= milestone) {
+          codes.push(code);
+        }
+      }
     }
 
     if (event.wagerWon) {

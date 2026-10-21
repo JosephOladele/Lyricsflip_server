@@ -31,35 +31,57 @@ export class LoggerService implements NestLoggerService {
     // Formats
     // ------------------------------------------------------------------
 
-    /** Injects requestId from AsyncLocalStorage into every log record. */
-    const requestIdFormat = winston.format((info) => {
+    /** Injects requestId and OpenTelemetry trace_id into every log record. */
+    const telemetryFormat = winston.format((info) => {
       const rid = getRequestId();
       if (rid) {
         info['requestId'] = rid;
       }
+
+      try {
+        const api = require('@opentelemetry/api');
+        const activeSpan = api.trace?.getActiveSpan?.();
+        if (activeSpan) {
+          const spanContext = activeSpan.spanContext();
+          if (
+            spanContext &&
+            spanContext.traceId &&
+            spanContext.traceId !== '00000000000000000000000000000000'
+          ) {
+            info['trace_id'] = spanContext.traceId;
+            info['span_id'] = spanContext.spanId;
+          }
+        }
+      } catch {
+        // Fall back gracefully when OpenTelemetry is unavailable
+      }
+
       return info;
     })();
 
     const productionFormat = winston.format.combine(
-      requestIdFormat,
+      telemetryFormat,
       winston.format.timestamp(),
       winston.format.errors({ stack: true }),
       winston.format.json(),
     );
 
     const developmentFormat = winston.format.combine(
-      requestIdFormat,
+      telemetryFormat,
       winston.format.timestamp({ format: 'HH:mm:ss' }),
       winston.format.errors({ stack: true }),
       winston.format.colorize({ all: true }),
-      winston.format.printf(({ level, message, timestamp, context, requestId, stack, ...meta }) => {
-        const ctx = context ? ` [${context}]` : '';
-        const rid = requestId ? ` {${requestId}}` : '';
-        const metaStr = Object.keys(meta).length
-          ? ' ' + JSON.stringify(meta)
-          : '';
-        return `${timestamp}${rid} [${level}]${ctx}: ${stack ?? message}${metaStr}`;
-      }),
+      winston.format.printf(
+        ({ level, message, timestamp, context, requestId, trace_id, stack, ...meta }) => {
+          const ctx = context ? ` [${context}]` : '';
+          const rid = requestId ? ` {${requestId}}` : '';
+          const tid = trace_id ? ` [trace:${trace_id}]` : '';
+          const metaStr = Object.keys(meta).length
+            ? ' ' + JSON.stringify(meta)
+            : '';
+          return `${timestamp}${rid}${tid} [${level}]${ctx}: ${stack ?? message}${metaStr}`;
+        },
+      ),
     );
 
     // ------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from '../users/entities/user.entity';
@@ -105,12 +106,11 @@ export class AdminService {
   }
 
   async restoreLyric(id: number) {
-    const restored = await this.lyricsService.restore(id);
-    if (!restored) {
-      throw new NotFoundException(`Lyric with id ${id} not found`);
+    const lyric = await this.lyricsService.findOneIncludingInactive(id);
+    if (lyric.isActive) {
+      throw new ConflictException(`Lyric with id ${id} is already active`);
     }
-    await this.lyricsService.invalidateCache();
-    return restored;
+    return this.lyricsService.restore(id);
   }
 
   async importLyrics(

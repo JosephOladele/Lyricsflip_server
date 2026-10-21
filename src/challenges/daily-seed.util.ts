@@ -42,6 +42,28 @@ export function pickDeterministic(
   return pool.slice(0, take);
 }
 
+/**
+ * Builds the seed used to pick a day's lyric set. The server secret
+ * (`DAILY_CHALLENGE_SALT`) is mixed in so the set for a future day cannot be
+ * computed from the date and the (public, sequential) lyric ids alone.
+ */
+export function dailySeed(day: string, salt: string): string {
+  return `${salt}:${day}`;
+}
+
+/**
+ * Picks the lyric ids for a given UTC day. Without the server salt the result
+ * is not reproducible, so future daily sets stay unpredictable.
+ */
+export function pickDailyLyrics(
+  ids: number[],
+  count: number,
+  day: string,
+  salt: string,
+): number[] {
+  return pickDeterministic(ids, count, dailySeed(day, salt));
+}
+
 /** The current UTC day as `YYYY-MM-DD`. */
 export function utcDay(now: Date = new Date()): string {
   return now.toISOString().slice(0, 10);

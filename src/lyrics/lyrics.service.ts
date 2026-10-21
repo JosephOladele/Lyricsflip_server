@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ConflictException,
   Inject,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -224,6 +225,49 @@ export class LyricsService {
     });
   }
 
+  /**
+   * Load a lyric regardless of its active state. Admin-only: used by the
+   * restore flow, which must be able to see soft-deleted (inactive) lyrics.
+   * Bypasses the cache so a stale active-only entry cannot mask the row.
+   */
+  async findOneIncludingInactive(id: number): Promise<Lyrics> {
+    if (!id || id <= 0) {
+      throw new BadRequestException('Invalid lyrics ID');
+    }
+
+    const dbLyrics = await this.lyricsRepository.findOne({
+      where: { id },
+      relations: ['createdBy'],
+    });
+
+    if (!dbLyrics) {
+      throw new NotFoundException('Lyrics not found');
+    }
+
+    return dbLyrics;
+  }
+
+  /**
+   * Restore a soft-deleted lyric by setting isActive back to true. Throws
+   * ConflictException when the lyric is already active.
+   */
+  async restore(id: number): Promise<Lyrics> {
+    const lyrics = await this.findOneIncludingInactive(id);
+
+    if (lyrics.isActive) {
+      throw new ConflictException('Lyrics is already active');
+    }
+
+    lyrics.isActive = true;
+    const restored = await this.lyricsRepository.save(lyrics);
+
+    // The restored lyric must reappear in lists, categories, random and
+    // search results, so drop every lyrics cache entry.
+    await this.clearCache();
+
+    return restored;
+  }
+
   async update(
     id: number, // Fixed: should be number, not string
     updateLyricsDto: UpdateLyricsDto,
@@ -243,47 +287,6 @@ export class LyricsService {
       throw new NotFoundException('Lyrics not found');
     }
 
-    // Optional: Check if user is admin or creator
-    // if (lyrics.createdBy.id !== user.id && !user.isAdmin) {
-    //   throw new ForbiddenException('You can only update your own lyrics');
-    // }
-
-    // Update lyrics with new data
-    Object.assign(lyrics, updateLyricsDto);
-    lyrics.updatedAt = new Date(); // Assuming you have updatedAt field
-
-    if (updateLyricsDto.decade !== undefined && updateLyricsDto.decade !== null) {
-      lyrics.decade = normalizeDecade(updateLyricsDto.decade.toString());
-    }
-
-    if (updateLyricsDto.lyricSnippet !== undefined) {
-      this.assertSnippetWithinLimit(updateLyricsDto.lyricSnippet.trim());
-    }
-
-    const updatedLyrics = await this.lyricsRepository.save(lyrics);
-
-    // The edited lyric may appear in any list, category, random or search
-    // result, so drop every lyrics cache entry, not just lyrics:{id}.
-    await this.clearCache();
-
-    return updatedLyrics;
-  }
-
-  async remove(id: number): Promise<void> {
-    // Fixed: should be number, not string
-    // Validate ID
-    if (!id || id <= 0) {
-      throw new BadRequestException('Invalid lyrics ID');
-    }
-
-    const lyrics = await this.lyricsRepository.findOne({
-      where: { id, isActive: true },
-    });
-
-    if (!lyrics) {
-      throw new NotFoundException('Lyrics not found');
-    }
-
     // Soft delete by setting isActive to false instead of hard delete
     lyrics.isActive = false;
     await this.lyricsRepository.save(lyrics);
@@ -296,3 +299,15 @@ export class LyricsService {
    * Normalise a value for alias comparison: lower-case, trim,
 
 /* … truncated 8616 chars — edit only what you need near the top … */
+    // Optional: Check if user is admin or creator
+    // if (lyrics.createdBy.id !== user.id && !user.isAdmin) {
+    //   throw new ForbiddenException('You can only update your own lyrics');
+    // }
+
+    // Update lyrics with new data
+    Object.assign(lyrics, updateLyricsDto);
+    lyrics.updatedAt = new Date(); // Assuming you have updatedAt field
+
+    if (
+
+/* … truncated 1342 chars — edit only what you need near the top … */

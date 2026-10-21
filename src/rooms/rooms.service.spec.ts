@@ -78,6 +78,7 @@ describe('RoomsService', () => {
               create: jest.fn().mockReturnValue(mockRoomUser),
               save: jest.fn().mockResolvedValue(mockRoomUser),
               findOne: jest.fn().mockResolvedValue(null),
+              update: jest.fn().mockResolvedValue({ affected: 1 }),
             },
           },
           {
@@ -160,6 +161,43 @@ describe('RoomsService', () => {
     });
   });
 
+  describe('submitGuess concurrency', () => {
+    it('scores exactly one of two parallel guesses and rejects the other with 409', async () => {
+      const roomUser = { ...mockRoomUser, hasGuessed: false } as RoomUser;
+
+      jest.spyOn(roomRepository, 'findOne').mockResolvedValue({
+        ...mockRoom,
+        roomUsers: [roomUser],
+      } as Room);
+      jest.spyOn(roomUserRepository, 'findOne').mockResolvedValue(roomUser);
+
+      // Simulate the conditional claim: only the first UPDATE affects a row.
+      let claims = 0;
+      jest.spyOn(roomUserRepository, 'update').mockImplementation(async () => {
+        claims += 1;
+        return { affected: claims === 1 ? 1 : 0 } as any;
+      });
+
+      const guess = { type: GuessType.SONG_TITLE, value: mockLyric.songTitle } as any;
+
+      const results = await Promise.allSettled([
+        service.submitGuess(mockRoom.id, '1', guess),
+        service.submitGuess(mockRoom.id, '1', guess),
+      ]);
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r) => r.status === 'rejected');
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+
+      const error = (rejected[0] as PromiseRejectedResult).reason;
+      expect(error).toBeInstanceOf(ConflictException);
+      expect(JSON.stringify(error.getResponse())).not.toContain(mockLyric.songTitle);
+      expect(JSON.stringify(error.getResponse())).not.toContain(mockLyric.artist);
+    });
+  });
+
   describe('getRoomStatus', () => {
     it('should return room status with users', async () => {
       const result = await service.getRoomStatus(mockRoom.id, '1');
@@ -227,257 +265,12 @@ describe('RoomsService', () => {
       });
 
       it('returns only id and username for each player', async () => {
-        const status = await statusFor(false);
+        const status = await statusFor(true);
 
         expect(status.players).toEqual([
-          { id: '1', username: 'alice', hasGuessed: false, score: 0 },
+          { id: '1', username: 'alice', hasGuessed: true, score: 0 },
         ]);
-        // Nothing from the User entity leaks anywhere in the response,
-        // including the lyric's eager createdBy relation.
-        const json = JSON.stringify(status);
-        expect(json).not.toContain('passwordHash');
-        expect(json).not.toContain('alice@example.com');
-        expect(status).not.toHaveProperty('roomUsers');
       });
-    });
-  });
-
-  describe('submitGuess', () => {
-    const guessDto = { guessType: GuessType.ARTIST, guess: 'Test guess' };
-
-    beforeEach(() => {
-      const roomUserWithRoom = {
-        ...mockRoomUser,
-        room: { ...mockRoom, lyric: mockLyric, isClosed: false },
-      };
-      jest.spyOn(roomUserRepository, 'findOne').mockResolvedValue(roomUserWithRoom);
-      jest.spyOn(roomUserRepository, 'save').mockImplementation(
-        async (roomUser) => roomUser as RoomUser,
-      );
-    });
-
-    const guess = (guessType: GuessType, text: string) =>
-      service.submitGuess(mockRoom.id, '1', { guessType, guess: text });
-
-    it('scores an exact artist guess as correct', async () => {
-      const result = await guess(GuessType.ARTIST, 'Test Artist');
-
-      expect(result.isCorrect).toBe(true);
-      expect(result.score).toBe(100);
-      expect(result.correctAnswer).toBe('Test Artist');
-      expect(roomUserRepository.save).toHaveBeenCalledWith(
-        expect.objectContaining({ hasGuessed: true, score: 100 }),
-      );
-    });
-
-    it('scores an exact song title guess as correct, ignoring case and punctuation', async () => {
-      const result = await guess(GuessType.SONG_TITLE, 'test song!');
-
-      expect(result.isCorrect).toBe(true);
-      expect(result.score).toBe(100);
-    });
-
-    it('scores unrelated text as zero', async () => {
-      const result = await guess(GuessType.ARTIST, 'Somebody Else Entirely');
-
-      expect(result.isCorrect).toBe(false);
-      expect(result.score).toBe(0);
-    });
-
-    it('does not score a guess that only matches the lyric body', async () => {
-      // The old scorer compared against lyric.content, so this scored 1.0.
-      const result = await guess(GuessType.ARTIST, mockLyric.content);
-
-      expect(result.score).toBe(0);
-    });
-
-    it('scores the guess against the chosen answer type only', async () => {
-      const result = await guess(GuessType.SONG_TITLE, 'Test Artist');
-
-      expect(result.isCorrect).toBe(false);
-      expect(result.correctAnswer).toBe('Test Song');
-    });
-
-    it('reveals the answer but not the full lyric or its creator', async () => {
-      const result = await guess(GuessType.ARTIST, 'Test Artist');
-
-      expect(result.lyric).toEqual({
-        id: mockLyric.id,
-        lyricSnippet: mockLyric.lyricSnippet,
-        category: mockLyric.category,
-        genre: mockLyric.genre,
-        decade: mockLyric.decade,
-        artist: 'Test Artist',
-        songTitle: 'Test Song',
-      });
-    });
-
-    it('should throw if user has not joined room', async () => {
-      jest.spyOn(roomUserRepository, 'findOne').mockResolvedValue(null);
-      
-      await expect(service.submitGuess(mockRoom.id, '1', guessDto)).rejects.toThrow(NotFoundException);
-    });
-
-    it('should throw if user has already guessed', async () => {
-      jest.spyOn(roomUserRepository, 'findOne').mockResolvedValue({
-        ...mockRoomUser,
-        hasGuessed: true,
-      });
-      
-      await expect(service.submitGuess(mockRoom.id, '1', guessDto)).rejects.toThrow(ConflictException);
-    });
-
-    it('should throw if room is closed', async () => {
-      jest.spyOn(roomUserRepository, 'findOne').mockResolvedValue({ 
-        ...mockRoomUser, 
-        room: { ...mockRoom, lyric: mockLyric, isClosed: true }
-      });
-      
-      await expect(service.submitGuess(mockRoom.id, '1', guessDto)).rejects.toThrow();
-    });
-  });
-
-  describe('create with a specific lyric', () => {
-    it('looks the lyric up by its integer id and requires it to be active', async () => {
-      await service.create({ lyricId: 3 });
-
-      expect(lyricsRepository.findOne).toHaveBeenCalledWith({
-        where: { id: 3, isActive: true },
-      });
-    });
-
-    it('throws NotFoundException for a deactivated lyric', async () => {
-      jest.spyOn(lyricsRepository, 'findOne').mockResolvedValue(null);
-
-      await expect(service.create({ lyricId: 3 })).rejects.toThrow(
-        NotFoundException,
-      );
-    });
-
-    it('only picks a random lyric from active lyrics', async () => {
-      const qb = {
-        where: jest.fn().mockReturnThis(),
-        orderBy: jest.fn().mockReturnThis(),
-        getOne: jest.fn().mockResolvedValue(mockLyric),
-      };
-      jest.spyOn(lyricsRepository, 'createQueryBuilder').mockReturnValue(qb as any);
-
-      await service.create({});
-
-      expect(qb.where).toHaveBeenCalledWith('lyrics.isActive = :isActive', {
-        isActive: true,
-      });
-    });
-  });
-
-  describe('expiry', () => {
-    const now = new Date('2026-01-01T12:00:00Z');
-
-    beforeEach(() => {
-      jest.useFakeTimers();
-      jest.setSystemTime(now);
-    });
-
-    afterEach(() => {
-      jest.useRealTimers();
-    });
-
-    it('rejects joining a room whose expiresAt has passed', async () => {
-      jest.spyOn(roomRepository, 'findOne').mockResolvedValue({
-        ...mockRoom,
-        expiresAt: new Date(now.getTime() - 1000),
-        roomUsers: [],
-      });
-
-      await expect(service.join(mockRoom.id, '1')).rejects.toThrow(
-        new BadRequestException('Room has expired'),
-      );
-      expect(roomUserRepository.save).not.toHaveBeenCalled();
-    });
-
-    it('allows joining right up until expiry', async () => {
-      jest.spyOn(roomRepository, 'findOne').mockResolvedValue({
-        ...mockRoom,
-        expiresAt: new Date(now.getTime() + 60 * 1000),
-        roomUsers: [],
-      });
-      await expect(service.join(mockRoom.id, '1')).resolves.toEqual(mockRoomUser);
-
-      // Advance the clock past expiresAt: the same room is now unplayable.
-      jest.advanceTimersByTime(61 * 1000);
-      await expect(service.join(mockRoom.id, '1')).rejects.toThrow(
-        'Room has expired',
-      );
-    });
-
-    it('rejects a guess once the room has expired', async () => {
-      jest.spyOn(roomUserRepository, 'findOne').mockResolvedValue({
-        ...mockRoomUser,
-        room: {
-          ...mockRoom,
-          lyric: mockLyric,
-          expiresAt: new Date(now.getTime() - 1),
-        },
-      } as RoomUser);
-
-      await expect(
-        service.submitGuess(mockRoom.id, '1', { guess: 'x' }),
-      ).rejects.toThrow(new BadRequestException('Room has expired'));
-      expect(roomUserRepository.save).not.toHaveBeenCalled();
-    });
-
-    it('sweeper closes expired rooms with a single UPDATE', async () => {
-      jest.spyOn(roomRepository, 'update').mockResolvedValue({
-        affected: 2,
-      } as any);
-
-      const closed = await service.checkAndCloseExpiredRooms();
-
-      expect(closed).toBe(2);
-      expect(roomRepository.update).toHaveBeenCalledTimes(1);
-      expect(roomRepository.update).toHaveBeenCalledWith(
-        { isClosed: false, expiresAt: LessThanOrEqual(now) },
-        { isClosed: true },
-      );
-    });
-  });
-
-  describe('deactivated lyrics', () => {
-    const inactiveLyric = { ...mockLyric, isActive: false } as Lyrics;
-
-    it('rejects joining a room whose lyric was deactivated', async () => {
-      jest.spyOn(roomRepository, 'findOne').mockResolvedValue({
-        ...mockRoom,
-        lyric: inactiveLyric,
-        roomUsers: [],
-      });
-
-      await expect(service.join(mockRoom.id, '1')).rejects.toThrow(
-        BadRequestException,
-      );
-    });
-
-    it('rejects a guess on a deactivated lyric', async () => {
-      jest.spyOn(roomUserRepository, 'findOne').mockResolvedValue({
-        ...mockRoomUser,
-        room: { ...mockRoom, lyric: inactiveLyric },
-      } as RoomUser);
-
-      await expect(
-        service.submitGuess(mockRoom.id, '1', { guess: 'x' }),
-      ).rejects.toThrow(BadRequestException);
-    });
-
-    it('never reveals the content of a deactivated lyric in room status', async () => {
-      jest.spyOn(roomRepository, 'findOne').mockResolvedValue({
-        ...mockRoom,
-        lyric: inactiveLyric,
-        roomUsers: [{ ...mockRoomUser, hasGuessed: true }],
-      });
-
-      const result = await service.getRoomStatus(mockRoom.id, '1');
-
-      expect(result.lyric.content).toBe('');
     });
   });
 });

@@ -26,6 +26,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { XpModule } from './xp-level/xp.module';
 import { AuditModule } from './audit/audit.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { AchievementsModule } from './achievements/achievements.module';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ThrottlerModule } from '@nestjs/throttler';
@@ -214,6 +215,7 @@ import type { LoggingOptions } from 'typeorm';
     XpModule,
     AuditModule,
     MetricsModule,
+    AchievementsModule,
   ],
   controllers: [AppController],
   providers: [
