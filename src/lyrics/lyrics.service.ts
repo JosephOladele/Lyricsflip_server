@@ -24,6 +24,14 @@ import { normalizeDecade } from '../game/progression.util';
  */
 export const MAX_LYRIC_SNIPPET_LENGTH = 150;
 
+/**
+ * Cache key holding the current lyrics namespace version. Every lyric cache
+ * key embeds this version, so bumping it invalidates all lyric entries at
+ * once — atomically, without a scan, and across every instance sharing the
+ * store (in-memory or Redis).
+ */
+export const LYRICS_NAMESPACE_KEY = 'lyrics:ns';
+
 export interface LyricsCacheStats {
   keys: number;
   keysByType: {
@@ -40,16 +48,10 @@ export class LyricsService {
   private readonly cacheTtlMs: number;
 
   /**
-   * Every lyrics cache key this service has written, with its expiry time.
-   * cache-manager has no prefix delete, so invalidation deletes these keys.
-   * The global store is in-memory and per-process, which this matches;
-   * moving to Redis (issue #115) would replace this with a prefix scan.
-   */
-  private readonly cachedKeys = new Map<string, number>();
-
-  /**
    * Bumped on every invalidation. A read that started before a write must not
-   * repopulate the cache with the data it loaded before that write.
+   * repopulate the cache with the data it loaded before that write. This is
+   * only an in-process race guard; cross-instance invalidation is handled by
+   * the shared namespace version key.
    */
   private cacheGeneration = 0;
 
@@ -73,6 +75,40 @@ export class LyricsService {
         `lyricSnippet must be at most ${MAX_LYRIC_SNIPPET_LENGTH} characters`,
       );
     }
+  }
+
+  /**
+   * Read the current namespace version from the shared cache. Defaults to 0
+   * when unset so the first write simply starts the counter.
+   */
+  private async getNamespaceVersion(): Promise<number> {
+    const version = await this.cacheManager.get<number>(LYRICS_NAMESPACE_KEY);
+    return typeof version === 'number' ? version : 0;
+  }
+
+  /**
+   * Build a cache key scoped to the current namespace version. Callers must
+   * resolve the version first so the key reflects the latest invalidation.
+   */
+  private namespacedKey(version: number, key: string): string {
+    return `lyrics:v${version}:${key}`;
+  }
+
+  /**
+   * Invalidate every lyric cache entry across all instances by advancing the
+   * shared namespace version. Old keys become unreachable and expire via TTL.
+   */
+  private async clearCache(): Promise<void> {
+    // In-process race guard: reads that started before this bump must not
+    // repopulate the cache with stale data.
+    this.cacheGeneration += 1;
+
+    const current = await this.getNamespaceVersion();
+    await this.cacheManager.set(
+      LYRICS_NAMESPACE_KEY,
+      current + 1,
+      this.cacheTtlMs,
+    );
   }
 
   async create(createLyricsDto: CreateLyricsDto, user: User): Promise<Lyrics> {
@@ -169,7 +205,11 @@ export class LyricsService {
       throw new BadRequestException('Invalid lyrics ID');
     }
 
-    const cacheKey = `${cacheConfig.keys.lyrics}${id}`;
+    const version = await this.getNamespaceVersion();
+    const cacheKey = this.namespacedKey(
+      version,
+      `${cacheConfig.keys.lyrics}${id}`,
+    );
 
     return this.getOrLoad(cacheKey, this.cacheTtlMs, async () => {
       const dbLyrics = await this.lyricsRepository.findOne({
@@ -247,6 +287,18 @@ export class LyricsService {
       throw new NotFoundException('Lyrics not found');
     }
 
+    // Soft delete by setting isActive to false instead of hard delete
+    lyrics.isActive = false;
+    await this.lyricsRepository.save(lyrics);
+
+    // Drop every lyrics cache entry that could still contain this lyric
+    await this.clearCache();
+  }
+
+  /**
+   * Normalise a value for alias comparison: lower-case, trim,
+
+/* … truncated 8616 chars — edit only what you need near the top … */
     // Optional: Check if user is admin or creator
     // if (lyrics.createdBy.id !== user.id && !user.isAdmin) {
     //   throw new ForbiddenException('You can only update your own lyrics');

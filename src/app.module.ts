@@ -54,18 +54,23 @@ import type { LoggingOptions } from 'typeorm';
     //    share the same cache and invalidation propagates across pods.
     //    When unset (local dev, CI) the default in-memory store is used as a
     //    fallback — no Redis required to run locally.
+    //
+    //    The in-memory entry cap is configurable via CACHE_MAX_ITEMS (#341).
+    //    For Redis, configure `maxmemory-policy allkeys-lru` on the server
+    //    (see README) — the `max` option is ignored by Redis stores.
     CacheModule.registerAsync({
       isGlobal: true,
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: async (configService: ConfigService) => {
         const redisUrl = configService.get<string>('REDIS_URL');
+        const maxItems = cacheConfig.getMaxItems(configService);
 
         if (redisUrl) {
           const { default: KeyvRedis } = await import('@keyv/redis');
           return {
             ttl: cacheConfig.defaultTtlMs,
-            max: cacheConfig.maxItems,
+            max: maxItems,
             stores: [new KeyvRedis(redisUrl)],
           };
         }
@@ -73,7 +78,7 @@ import type { LoggingOptions } from 'typeorm';
         // In-memory fallback (single instance / local dev)
         return {
           ttl: cacheConfig.defaultTtlMs,
-          max: cacheConfig.maxItems,
+          max: maxItems,
         };
       },
     }),
